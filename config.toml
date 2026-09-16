@@ -1,0 +1,13 @@
+# Tema do VetClinic
+[theme]
+primaryColor = "#16655F"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#E9F5F3"
+textColor = "#1E2930"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Dados locais — NUNCA publicar!
+vetclinic.db
+*.db-journal
+
+# Credenciais da nuvem — NUNCA publicar!
+db_config.json
+.streamlit/secrets.toml
+
+# Sistema
+.DS_Store
+Thumbs.db
