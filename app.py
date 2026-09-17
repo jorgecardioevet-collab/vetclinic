@@ -2697,6 +2697,30 @@ def pagina_usuarios():
                 st.rerun()
 
 
+def ler_anexo_dados(aid: int) -> bytes:
+    """Lê o BLOB do anexo de forma confiável (na nuvem, em pedaço 200 KB)."""
+    if nuvem_ativa():
+        total = qdf("SELECT length(dados) AS n FROM anexos WHERE id = ?", (aid,)).iloc[0]["n"]
+        total = int(total or 0)
+        if not total:
+            return b""
+        CHUNK = 200_000
+        partes = []
+        pos = 1
+        while pos <= total:
+            p = qdf("SELECT substr(dados, ?, ?) AS p FROM anexos WHERE id = ?",
+                    (pos, CHUNK, aid)).iloc[0]["p"]
+            partes.append(bytes(p or b""))
+            pos += CHUNK
+        dados = b"".join(partes)
+        if len(dados) != total:
+            raise RuntimeError(
+                f"leitura incompleta do blob ({len(dados)} de {total} bytes) — tente novamente"
+            )
+        return dados
+    return bytes(qdf("SELECT dados FROM anexos WHERE id = ?", (aid,)).iloc[0]["dados"] or b"")
+
+
 # --------------------------------------------------------------------------- #
 #  Página: Exames e anexos
 # --------------------------------------------------------------------------- #
@@ -2770,8 +2794,13 @@ def pagina_exames():
     op2 = {f"{r['nome']} — {r['descricao'] or 'sem descrição'} (#{r['id']})": r["id"] for _, r in df.iterrows()}
     sel2 = st.selectbox("Selecione o arquivo", list(op2.keys()))
     aid = op2[sel2]
-    reg = qdf("SELECT * FROM anexos WHERE id = ?", (aid,)).iloc[0]
-    dados = bytes(reg["dados"])
+    reg = qdf("SELECT id, nome, descricao, mime, tamanho, criado_em FROM anexos WHERE id = ?", (aid,)).iloc[0]
+    try:
+        dados = ler_anexo_dados(aid)
+    except Exception as e:
+        st.error(f"❌ Não foi possível ler o arquivo do banco em nuvem: {e}. "
+                 f"Tente novamente — se o erro persistir, reenvie o arquivo.")
+        return
 
     c1, c2 = st.columns([1, 3])
     c1.download_button("⬇️ Baixar arquivo", dados, reg["nome"],

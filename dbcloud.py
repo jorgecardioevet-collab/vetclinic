@@ -35,11 +35,26 @@ def _enc_valor(v):
     return {"type": "text", "value": str(v)}
 
 
+def _dec_blob(bruto: str) -> bytes:
+    """Decodifica base64 tolerando falta de padding e alfabeto URL-safe."""
+    import binascii
+    s = (bruto or "").strip()
+    padded = s + "=" * (-len(s) % 4)
+    try:
+        return base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        pass
+    try:
+        return base64.urlsafe_b64decode(padded)
+    except (binascii.Error, ValueError) as e:
+        raise TursoError(f"blob corrompido na resposta ({len(s)} chars base64): {e}")
+
+
 def _dec_valor(cell):
     """Converte uma célula da resposta da API de volta para Python."""
     tipo = cell.get("type")
     if tipo == "blob":
-        return base64.b64decode(cell.get("base64") or "")
+        return _dec_blob(cell.get("base64") or "")
     valor = cell.get("value")
     if tipo == "null" or valor is None:
         return None
