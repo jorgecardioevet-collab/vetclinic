@@ -192,6 +192,19 @@ CREATE TABLE IF NOT EXISTS servicos (
     ativo      INTEGER DEFAULT 1,
     criado_em  TEXT DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS laudos (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    pet_id       INTEGER NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+    numero       INTEGER DEFAULT 0,
+    data         TEXT NOT NULL,
+    tipo         TEXT NOT NULL,              -- 'abdominal' ou 'eco'
+    dados        TEXT NOT NULL DEFAULT '{}', -- JSON: descrições por órgão / medidas
+    conclusao    TEXT DEFAULT '',
+    recomendacoes TEXT DEFAULT '',
+    veterinario  TEXT DEFAULT '',
+    criado_em    TEXT DEFAULT (datetime('now', 'localtime'))
+);
 """
 
 
@@ -2988,6 +3001,329 @@ def migrar_local_para_nuvem() -> list:
     return relatorio
 
 
+# --------------------------------------------------------------------------- #
+#  Laudos ultrassonográficos (US abdominal + ecocardiograma)
+# --------------------------------------------------------------------------- #
+
+_ACHADO_PADRAO = "Sem alterações ecográficas evidentes."
+
+CAMPOS_US_ABDOMINAL = [
+    "Fígado", "Vias biliares e vesícula biliar", "Baço",
+    "Rim direito", "Rim esquerdo", "Bexiga urinária",
+    "Estômago", "Alças intestinais", "Pâncreas",
+    "Glândulas adrenais", "Linfonodos", "Útero e ovários / Próstata",
+    "Cavidade peritoneal",
+]
+
+CAMPOS_ECO_TEXTO = [
+    "Anatomia e função sistólica (modo-M / bidimensional)",
+    "Valva mitral", "Valva aórtica", "Valva tricúspide", "Valva pulmonar",
+    "Doppler — fluxos, refluxos e pressões estimadas", "Pericárdio",
+]
+
+MEDIDAS_ECO = [
+    "AO (mm)", "AE (mm)", "Relação AE/AO",
+    "DIVEd (mm)", "SIVd (mm)", "PLVEd (mm)",
+    "DIVEs (mm)", "SIVs (mm)", "PLVEs (mm)",
+    "FE (%)", "FS (%)", "FC (bpm)",
+]
+
+
+def _laudo_default_dados(tipo: str) -> dict:
+    campos = CAMPOS_US_ABDOMINAL if tipo == "abdominal" else CAMPOS_ECO_TEXTO
+    dados = {c: _ACHADO_PADRAO for c in campos}
+    if tipo == "eco":
+        dados["medidas"] = {m: "" for m in MEDIDAS_ECO}
+    return dados
+
+
+def gerar_pdf_laudo(tipo: str, numero: int, pet, dados: dict, conclusao: str,
+                    recomendacoes: str, data_iso: str, veterinario: str,
+                    cidade: str) -> bytes:
+    """Gera o PDF do laudo ultrassonográfico (abdominal ou ecocardiográfico)."""
+    if tipo == "abdominal":
+        titulo = "LAUDO DE ULTRASSONOGRAFIA ABDOMINAL"
+        campos = CAMPOS_US_ABDOMINAL
+    else:
+        titulo = "LAUDO ECOCARDIOGRÁFICO (MODO-M, BIDIMENSIONAL E DOPPLER)"
+        campos = CAMPOS_ECO_TEXTO
+    ano = datetime.strptime(data_iso, "%Y-%m-%d").year
+    pdf = novo_pdf(titulo, subtitulo=f"Nº {numero:04d}/{ano}")
+    dados_pet(pdf, pet)
+    pdf_campo(pdf, "Data do exame:", fmt_data(data_iso))
+    if veterinario.strip():
+        pdf_campo(pdf, "Examinador:", veterinario.strip())
+    pdf.ln(3)
+
+    def _campo_secao(rotulo: str, texto: str):
+        pdf.set_font("helvetica", "B", 10)
+        pdf.set_text_color(22, 101, 96)
+        pdf.cell(0, 5.5, pdf_san(rotulo), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30)
+        pdf.set_font("helvetica", "", 9.5)
+        pdf.multi_cell(0, 4.8, pdf_san((texto or "").strip() or "Não avaliado."),
+                       new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1.5)
+
+    if tipo == "eco":
+        medidas = dados.get("medidas", {}) or {}
+        linhas, atual = [], []
+        for m in MEDIDAS_ECO:
+            v = str(medidas.get(m, "") or "").strip()
+            if v:
+                atual.append((m, v))
+                if len(atual) == 3:
+                    linhas.append(atual)
+                    atual = []
+        if atual:
+            while len(atual) < 3:
+                atual.append(("", ""))
+            linhas.append(atual)
+        if linhas:
+            pdf.set_font("helvetica", "B", 11)
+            pdf.set_text_color(22, 101, 96)
+            pdf.cell(0, 7, "MEDIDAS", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(30)
+            pdf_tabela(pdf,
+                       ["Medida", "Valor", "Medida", "Valor", "Medida", "Valor"],
+                       [[a, b, c, d, e, f] for (a, b), (c, d), (e, f) in linhas],
+                       [30, 30, 30, 30, 30, 30], aligns=["L", "C", "L", "C", "L", "C"])
+            pdf.ln(4)
+        pdf.set_font("helvetica", "B", 11)
+        pdf.set_text_color(22, 101, 96)
+        pdf.cell(0, 7, "AVALIAÇÃO", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30)
+        pdf.ln(1)
+
+    if tipo == "abdominal":
+        pdf.set_font("helvetica", "B", 11)
+        pdf.set_text_color(22, 101, 96)
+        pdf.cell(0, 7, "ACHADOS ULTRASSONOGRÁFICOS", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30)
+        pdf.ln(1)
+
+    for campo in campos:
+        _campo_secao(campo + ":", dados.get(campo, ""))
+
+    pdf.ln(2)
+    pdf.set_font("helvetica", "B", 11)
+    pdf.set_text_color(22, 101, 96)
+    pdf.cell(0, 7, "CONCLUSÃO / IMPRESSÃO DIAGNÓSTICA", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(30)
+    pdf.set_font("helvetica", "", 10)
+    pdf.set_fill_color(233, 245, 243)
+    pdf.multi_cell(0, 5.2, pdf_san(conclusao.strip()), fill=True,
+                   new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    if recomendacoes.strip():
+        pdf.set_font("helvetica", "B", 10)
+        pdf.cell(0, 6, "Recomendações:", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("helvetica", "", 9.5)
+        pdf.multi_cell(0, 4.8, pdf_san(recomendacoes.strip()),
+                       new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+
+    d = datetime.strptime(data_iso, "%Y-%m-%d")
+    meses = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho",
+             "agosto", "setembro", "outubro", "novembro", "dezembro"]
+    pdf.set_font("helvetica", "", 10)
+    pdf.cell(0, 6, pdf_san(f"{(cidade or 'Penha/SC')}, {d.day} de {meses[d.month - 1]} de {d.year}."),
+             new_x="LMARGIN", new_y="NEXT")
+    assinatura(pdf)
+    return bytes(pdf.output())
+
+
+def _render_laudo_pdf_widgets(pdf_bytes: bytes, numero: int, pet_nome: str, key_sufixo: str):
+    st.download_button(
+        f"⬇️ Baixar laudo nº {numero:04d} (PDF{' assinado' if assinatura_ativa() and st.session_state.get('cert_senha') else ''})",
+        pdf_bytes,
+        f"laudo_{numero:04d}_{pet_nome.lower().replace(' ', '_')}.pdf",
+        "application/pdf", type="primary", key=f"dl_laudo_{key_sufixo}")
+
+
+def pagina_laudos():
+    st.header("🔬 Laudos ultrassonográficos")
+    st.caption("Modelos próprios de **ultrassom abdominal** e **ecocardiograma**. "
+               "Os campos já vêm preenchidos com \"sem alterações\" — edite apenas o que encontrou "
+               "no exame. O laudo fica salvo no cadastro do pet e sai em PDF com seu carimbo "
+               "(e assinatura digital ICP-Brasil, se estiver desbloqueada).")
+
+    pets = qdf(
+        """SELECT p.id, p.nome, t.nome AS tutor FROM pets p
+           JOIN tutores t ON t.id = p.tutor_id ORDER BY p.nome"""
+    )
+    if pets.empty:
+        st.info("Cadastre um tutor e um pet primeiro.")
+        return
+
+    op = {f"{r['nome']} — {r['tutor']}": r["id"] for _, r in pets.iterrows()}
+    pid = op[st.selectbox("Pet", list(op.keys()), key="ld_pet")]
+    pet = qdf(
+        """SELECT p.*, t.nome AS tutor, t.telefone FROM pets p
+           JOIN tutores t ON t.id = p.tutor_id WHERE p.id = ?""",
+        (pid,),
+    ).iloc[0]
+
+    # PDF recém-gerado sobrevive ao rerun (padrão da página de receitas)
+    if st.session_state.get("ld_pdf"):
+        with st.container(border=True):
+            st.success(f"✅ Laudo nº {st.session_state['ld_num']:04d} "
+                       f"de **{st.session_state['ld_pet']}** pronto!")
+            _render_laudo_pdf_widgets(st.session_state["ld_pdf"], st.session_state["ld_num"],
+                                      st.session_state["ld_pet"], "novo")
+
+    editando = st.session_state.get("ld_edit")  # dict do laudo em edição ou None
+
+    # ---- Novo laudo / Edição ------------------------------------------------ #
+    titulo_exp = "✏️ Editando laudo nº {:04d} — clique em ✖ para cancelar".format(editando["numero"]) \
+        if editando else "➕ Novo laudo"
+    with st.expander(titulo_exp, expanded=True):
+        if editando:
+            if st.button("✖ Cancelar edição", key="ld_cancel"):
+                st.session_state.pop("ld_edit", None)
+                st.rerun()
+
+        edit_id = editando["id"] if editando else 0
+        tipo_lbl = ["🔊 Ultrassom abdominal", "❤️ Ecocardiograma (Doppler)"]
+        tipo_ix = 1 if (editando and editando["tipo"] == "eco") else 0
+        tipo_sel = st.radio("Modelo do laudo", tipo_lbl, horizontal=True,
+                            index=tipo_ix, key=f"ld_tipo_{edit_id}",
+                            disabled=bool(editando))
+        tipo = "eco" if tipo_sel.startswith("❤️") else "abdominal"
+
+        if editando:
+            dados_ant = json.loads(editando["dados"] or "{}")
+            dados_ini = _laudo_default_dados(tipo)
+            dados_ini.update({k: v for k, v in dados_ant.items() if k != "medidas" or tipo == "eco"})
+            if tipo == "eco":
+                med = dados_ini.get("medidas") or {}
+                dados_ini["medidas"] = {m: str((dados_ant.get("medidas") or {}).get(m, ""))
+                                        for m in MEDIDAS_ECO}
+        else:
+            dados_ini = _laudo_default_dados(tipo)
+
+        with st.form(f"form_laudo_{edit_id}_{tipo}"):
+            c1, c2, c3 = st.columns(3)
+            data_ex = c1.date_input("Data do exame *", format="DD/MM/YYYY",
+                                    value=datetime.strptime(editando["data"], "%Y-%m-%d").date()
+                                    if editando else date.today())
+            vet_def = editando["veterinario"] if editando else \
+                (get_config("carimbo_nome", "") or st.session_state.usuario.get("nome", ""))
+            veterinario = c2.text_input("Veterinário(a) examinador(a)", value=vet_def or "")
+            cidade = c3.text_input("Local (cidade/UF)",
+                                   value=get_config("rec_cidade", "Penha/SC") or "Penha/SC")
+
+            if tipo == "eco":
+                st.markdown("**📏 Medidas** *(preencha só as aferidas)*")
+                medidas = {}
+                cols = st.columns(3)
+                med_ini = dados_ini.get("medidas", {})
+                for i, m in enumerate(MEDIDAS_ECO):
+                    medidas[m] = cols[i % 3].text_input(
+                        m, value=str(med_ini.get(m, "")), key=f"ld{edit_id}_eco_med_{i}",
+                        placeholder="—")
+                st.markdown("**📝 Avaliação**")
+
+            campos = CAMPOS_US_ABDOMINAL if tipo == "abdominal" else CAMPOS_ECO_TEXTO
+            descricoes = {}
+            for i, campo in enumerate(campos):
+                descricoes[campo] = st.text_area(
+                    campo, value=dados_ini.get(campo, _ACHADO_PADRAO),
+                    height=52, key=f"ld{edit_id}_{tipo}_campo_{i}")
+
+            conclusao = st.text_area(
+                "Conclusão / impressão diagnóstica *",
+                value=editando["conclusao"] if editando else "", height=90,
+                key=f"ld{edit_id}_{tipo}_concl",
+                placeholder="Ex.: Ecoconstituição e ecogenicidade preservadas de todos os órgãos avaliados…")
+            recomendacoes = st.text_area(
+                "Recomendações (opcional)",
+                value=editando["recomendacoes"] if editando else "", height=52,
+                key=f"ld{edit_id}_{tipo}_rec",
+                placeholder="Ex.: Reavaliação em 30 dias; correlacionar com exames laboratoriais.")
+            reg_hist = st.checkbox("Registrar também no histórico do pet",
+                                   value=True, disabled=bool(editando),
+                                   help="Na edição, o registro do histórico original é mantido.")
+            salvar = st.form_submit_button(
+                "💾 Salvar laudo e gerar PDF" if not editando else "💾 Salvar alterações e gerar PDF",
+                type="primary")
+
+        if salvar:
+            if not conclusao.strip():
+                st.error("A **conclusão** é obrigatória.")
+            else:
+                dados_json = json.dumps(descricoes | ({"medidas": medidas} if tipo == "eco" else {}),
+                                        ensure_ascii=False)
+                set_config("rec_cidade", cidade.strip() or "Penha/SC")
+                if editando:
+                    numero = int(editando["numero"])
+                    run("""UPDATE laudos SET data=?, dados=?, conclusao=?, recomendacoes=?,
+                           veterinario=? WHERE id=?""",
+                        (data_ex.isoformat(), dados_json, conclusao.strip(),
+                         recomendacoes.strip(), veterinario.strip(), edit_id))
+                else:
+                    numero = proximo_numero("laudo_seq")
+                    run("""INSERT INTO laudos (pet_id, numero, data, tipo, dados, conclusao,
+                                               recomendacoes, veterinario)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (pid, numero, data_ex.isoformat(), tipo, dados_json,
+                         conclusao.strip(), recomendacoes.strip(), veterinario.strip()))
+                    if reg_hist:
+                        rotulo = "Laudo US abdominal" if tipo == "abdominal" else "Laudo ecocardiograma"
+                        run("""INSERT INTO historico (pet_id, data, tipo, veterinario, descricao)
+                               VALUES (?,?,?,?,?)""",
+                            (pid, data_ex.isoformat(), rotulo,
+                             veterinario.strip() or (get_config("carimbo_nome", "") or ""),
+                             f"{rotulo} nº {numero:04d}/{data_ex.year} — {trunc(conclusao, 380)}"))
+                pdf_bytes = finalizar_pdf(gerar_pdf_laudo(
+                    tipo, numero, pet,
+                    json.loads(dados_json), conclusao, recomendacoes,
+                    data_ex.isoformat(), veterinario, cidade.strip()))
+                st.session_state["ld_pdf"] = pdf_bytes
+                st.session_state["ld_num"] = numero
+                st.session_state["ld_pet"] = pet["nome"]
+                st.session_state.pop("ld_edit", None)
+                st.rerun()
+
+    # ---- Laudos salvos do pet ------------------------------------------------ #
+    with st.expander("📂 Laudos salvos deste pet"):
+        laudos = qdf(
+            "SELECT id, numero, data, tipo, dados, conclusao, recomendacoes, veterinario "
+            "FROM laudos WHERE pet_id = ? ORDER BY data DESC, id DESC", (pid,))
+        if laudos.empty:
+            st.info("Nenhum laudo salvo para este pet ainda.")
+        else:
+            st.caption(f"{len(laudos)} laudo(s). O PDF pode ser gerado novamente a qualquer momento "
+                       "(sai sempre atualizado, com carimbo e assinatura quando ativa).")
+            for _, ld in laudos.iterrows():
+                rotulo = "US abdominal" if ld["tipo"] == "abdominal" else "Ecocardiograma"
+                st.markdown(f"**#{int(ld['numero']):04d}/{str(ld['data'])[:4]} — {rotulo}** "
+                            f"· exame em {fmt_data(ld['data'])}"
+                            + (f" · Dr(a). {ld['veterinario']}" if ld["veterinario"] else ""))
+                st.caption("Conclusão: " + (trunc(ld["conclusao"], 160) or "—"))
+                b1, b2, b3 = st.columns([2, 2, 3])
+                if b1.button("⬇️ Gerar PDF", key=f"ld_pdf_{ld['id']}", use_container_width=True):
+                    pdf_bytes = finalizar_pdf(gerar_pdf_laudo(
+                        ld["tipo"], int(ld["numero"]), pet, json.loads(ld["dados"] or "{}"),
+                        ld["conclusao"] or "", ld["recomendacoes"] or "", ld["data"],
+                        ld["veterinario"] or "", get_config("rec_cidade", "Penha/SC") or "Penha/SC"))
+                    st.session_state["ld_pdf"] = pdf_bytes
+                    st.session_state["ld_num"] = int(ld["numero"])
+                    st.session_state["ld_pet"] = pet["nome"]
+                    st.rerun()
+                if b2.button("✏️ Editar", key=f"ld_editbtn_{ld['id']}", use_container_width=True):
+                    st.session_state["ld_edit"] = dict(ld)
+                    st.rerun()
+                conf_l = st.checkbox("Confirmo excluir", key=f"ld_conf_{ld['id']}")
+                if b3.button("🗑️ Excluir laudo", key=f"ld_del_{ld['id']}", disabled=not conf_l):
+                    run("DELETE FROM laudos WHERE id = ?", (int(ld["id"]),))
+                    st.session_state.pop("ld_edit", None)
+                    st.success("Laudo excluído.")
+                    st.rerun()
+                st.divider()
+
+
 def pagina_nuvem():
     st.header("☁️ Banco de dados em nuvem")
     url, token = config_nuvem()
@@ -3197,7 +3533,7 @@ def main():
     st.sidebar.divider()
 
     opcoes = ["🏠 Início", "📅 Agenda", "💉 Vacinas", "👤 Tutores", "🐾 Pets",
-              "📋 Histórico", "📎 Exames", "💰 Financeiro", "🧾 Recibos/NF", "📄 Relatórios"]
+              "📋 Histórico", "📎 Exames", "🔬 Laudos", "💰 Financeiro", "🧾 Recibos/NF", "📄 Relatórios"]
     if eu["papel"] == "admin":
         opcoes += ["🔐 Usuários", "🔏 Assinatura", "☁️ Nuvem"]
     pagina = st.sidebar.radio("Menu", opcoes)
@@ -3210,7 +3546,8 @@ def main():
         st.divider()
         apagar = st.checkbox("⚠️ Confirmo apagar TODOS os dados (exceto usuários)", key="conf_wipe")
         if st.button("🗑️ Apagar todos os dados", use_container_width=True, disabled=not apagar):
-            for tabela in ("lancamentos", "vacinas", "agendamentos", "historico", "anexos", "pets", "tutores"):
+            for tabela in ("lancamentos", "vacinas", "agendamentos", "historico", "anexos",
+                           "laudos", "pets", "tutores"):
                 run(f"DELETE FROM {tabela}")
             st.sidebar.success("Banco de dados limpo! (usuários mantidos)")
             st.rerun()
@@ -3229,6 +3566,8 @@ def main():
         pagina_historico()
     elif pagina == "📎 Exames":
         pagina_exames()
+    elif pagina == "🔬 Laudos":
+        pagina_laudos()
     elif pagina == "💰 Financeiro":
         pagina_financeiro()
     elif pagina == "🧾 Recibos/NF":
