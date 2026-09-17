@@ -1525,6 +1525,12 @@ def novo_pdf(titulo: str, subtitulo: str = "") -> FPDF:
     pdf.set_margins(15, 15, 15)
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
+    if os.path.exists("assets/logo.png"):
+        try:
+            pdf.image("assets/logo.png", x=168, y=12, w=27)
+        except Exception:
+            pass  # se a imagem falhar, o PDF sai sem logo
+        pdf.set_y(42)
     pdf.set_font("helvetica", "B", 17)
     pdf.set_text_color(22, 101, 96)
     pdf.cell(0, 10, "VetClinic - Clínica Veterinária", align="C", new_x="LMARGIN", new_y="NEXT")
@@ -1787,6 +1793,10 @@ PAPEIS_ORDEM = ["recepcao", "veterinario", "admin"]
 
 
 def tela_login():
+    col_img, _ = st.columns([1, 2])
+    if os.path.exists("assets/logo_login.png"):
+        with col_img:
+            st.image("assets/logo_login.png", use_container_width=True)
     st.title("🐾 VetClinic")
     st.subheader("Gestão de clínica veterinária")
     st.divider()
@@ -2226,7 +2236,7 @@ def carregar_exemplos():
 def main():
     st.set_page_config(
         page_title="VetClinic — Gestão Veterinária",
-        page_icon="🐾",
+        page_icon="assets/favicon.png" if os.path.exists("assets/favicon.png") else "🐾",
         layout="wide",
     )
     init_db()
@@ -2237,6 +2247,10 @@ def main():
 
     eu = st.session_state.usuario
 
+    if os.path.exists("assets/logo.png"):
+        _c1, _c2, _c3 = st.sidebar.columns([1, 2, 1])
+        with _c2:
+            st.image("assets/logo.png", use_container_width=True)
     st.sidebar.title("🐾 VetClinic")
     st.sidebar.caption(f"👤 {eu['nome']} ({PAPEIS.get(eu['papel'], eu['papel'])})  ·  "
                        f"{'☁️ Nuvem' if nuvem_ativa() else '💾 Local'}")
