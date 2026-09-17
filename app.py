@@ -2698,21 +2698,21 @@ def pagina_usuarios():
 
 
 def ler_anexo_dados(aid: int) -> bytes:
-    """Lê o BLOB do anexo de forma confiável (na nuvem, em pedaço 200 KB)."""
+    """Lê o BLOB do anexo de forma à prova de encoding (hexadecimal puro, em pedaços)."""
     if nuvem_ativa():
         total = qdf("SELECT length(dados) AS n FROM anexos WHERE id = ?", (aid,)).iloc[0]["n"]
         total = int(total or 0)
         if not total:
             return b""
-        CHUNK = 200_000
-        partes = []
+        CHUNK = 100_000  # bytes por query — respostas ficam pequenas e seguras
+        hex_partes = []
         pos = 1
         while pos <= total:
-            p = qdf("SELECT substr(dados, ?, ?) AS p FROM anexos WHERE id = ?",
-                    (pos, CHUNK, aid)).iloc[0]["p"]
-            partes.append(bytes(p or b""))
+            h = qdf("SELECT hex(substr(dados, ?, ?)) AS h FROM anexos WHERE id = ?",
+                    (pos, CHUNK, aid)).iloc[0]["h"] or ""
+            hex_partes.append(str(h))
             pos += CHUNK
-        dados = b"".join(partes)
+        dados = bytes.fromhex("".join(hex_partes))
         if len(dados) != total:
             raise RuntimeError(
                 f"leitura incompleta do blob ({len(dados)} de {total} bytes) — tente novamente"
