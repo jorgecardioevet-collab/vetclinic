@@ -7,6 +7,7 @@ Execute com:  streamlit run app.py
 """
 
 import hashlib
+import io
 import json
 import os
 import secrets
@@ -204,6 +205,15 @@ CREATE TABLE IF NOT EXISTS laudos (
     recomendacoes TEXT DEFAULT '',
     veterinario  TEXT DEFAULT '',
     criado_em    TEXT DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS laudo_imagens (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    laudo_id  INTEGER NOT NULL REFERENCES laudos(id) ON DELETE CASCADE,
+    ordem     INTEGER DEFAULT 0,
+    legenda   TEXT DEFAULT '',
+    dados     BLOB,
+    criado_em TEXT DEFAULT (datetime('now', 'localtime'))
 );
 """
 
@@ -2837,10 +2847,13 @@ def pagina_usuarios():
                 st.rerun()
 
 
-def ler_anexo_dados(aid: int) -> bytes:
-    """Lê o BLOB do anexo de forma à prova de encoding (hexadecimal puro, em pedaços)."""
+def _ler_blob(tabela: str, rid: int) -> bytes:
+    """Lê um BLOB de forma à prova de encoding (hexadecimal puro, em pedaços).
+
+    `tabela` deve ser um nome de tabela interno/conhecido (anexos, laudo_imagens).
+    """
     if nuvem_ativa():
-        total = qdf("SELECT length(dados) AS n FROM anexos WHERE id = ?", (aid,)).iloc[0]["n"]
+        total = qdf(f"SELECT length(dados) AS n FROM {tabela} WHERE id = ?", (rid,)).iloc[0]["n"]
         total = int(total or 0)
         if not total:
             return b""
@@ -2848,8 +2861,8 @@ def ler_anexo_dados(aid: int) -> bytes:
         hex_partes = []
         pos = 1
         while pos <= total:
-            h = qdf("SELECT hex(substr(dados, ?, ?)) AS h FROM anexos WHERE id = ?",
-                    (pos, CHUNK, aid)).iloc[0]["h"] or ""
+            h = qdf(f"SELECT hex(substr(dados, ?, ?)) AS h FROM {tabela} WHERE id = ?",
+                    (pos, CHUNK, rid)).iloc[0]["h"] or ""
             hex_partes.append(str(h))
             pos += CHUNK
         dados = bytes.fromhex("".join(hex_partes))
@@ -2858,7 +2871,26 @@ def ler_anexo_dados(aid: int) -> bytes:
                 f"leitura incompleta do blob ({len(dados)} de {total} bytes) — tente novamente"
             )
         return dados
-    return bytes(qdf("SELECT dados FROM anexos WHERE id = ?", (aid,)).iloc[0]["dados"] or b"")
+    return bytes(qdf(f"SELECT dados FROM {tabela} WHERE id = ?", (rid,)).iloc[0]["dados"] or b"")
+
+
+def ler_anexo_dados(aid: int) -> bytes:
+    """Lê o BLOB do anexo de forma à prova de encoding (hexadecimal puro, em pedaços)."""
+    return _ler_blob("anexos", aid)
+
+
+def ler_laudo_imagens(laudo_id: int) -> list:
+    """Retorna [(legenda, bytes), ...] das imagens JPG do laudo, na ordem."""
+    rows = qdf("SELECT id, legenda FROM laudo_imagens WHERE laudo_id = ? ORDER BY ordem, id",
+               (int(laudo_id),))
+    imgs = []
+    for _, r in rows.iterrows():
+        try:
+            imgs.append(((r["legenda"] or "").strip(), _ler_blob("laudo_imagens", int(r["id"]))))
+        except Exception as e:
+            st.warning(f"⚠️ Não foi possível ler uma das imagens do laudo ({e}). "
+                       "Ela foi omitida do PDF — tente novamente ou recadastre a imagem.")
+    return imgs
 
 
 # --------------------------------------------------------------------------- #
@@ -3039,8 +3071,11 @@ def _laudo_default_dados(tipo: str) -> dict:
 
 def gerar_pdf_laudo(tipo: str, numero: int, pet, dados: dict, conclusao: str,
                     recomendacoes: str, data_iso: str, veterinario: str,
-                    cidade: str) -> bytes:
-    """Gera o PDF do laudo ultrassonográfico (abdominal ou ecocardiográfico)."""
+                    cidade: str, imagens: list | None = None) -> bytes:
+    """Gera o PDF do laudo ultrassonográfico (abdominal ou ecocardiográfico).
+
+    `imagens`: lista de (legenda, bytes_jpg) exibida em grade após os achados.
+    """
     if tipo == "abdominal":
         titulo = "LAUDO DE ULTRASSONOGRAFIA ABDOMINAL"
         campos = CAMPOS_US_ABDOMINAL
@@ -3105,6 +3140,42 @@ def gerar_pdf_laudo(tipo: str, numero: int, pet, dados: dict, conclusao: str,
     for campo in campos:
         _campo_secao(campo + ":", dados.get(campo, ""))
 
+    # ---- Grade de imagens do exame (JPG) ------------------------------------ #
+    imagens = imagens or []
+    if imagens:
+        pdf.ln(1)
+        pdf.set_font("helvetica", "B", 11)
+        pdf.set_text_color(22, 101, 96)
+        pdf.cell(0, 7, "IMAGENS DO EXAME", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30)
+        pdf.ln(1)
+        W_CELL, H_CELL, GAP = 85, 54, 10  # mm — grade de 2 colunas
+        for base in range(0, len(imagens), 2):
+            linha = imagens[base:base + 2]
+            if pdf.get_y() + H_CELL + 18 > 278:  # quebra de página antes da linha
+                pdf.add_page()
+            y0 = pdf.get_y()
+            h_leg_max = 0.0
+            for col, (legenda, img_bytes) in enumerate(linha):
+                x = 15 + col * (W_CELL + GAP)
+                try:
+                    pdf.image(io.BytesIO(img_bytes), x=x, y=y0,
+                              w=W_CELL, h=H_CELL, keep_aspect_ratio=True)
+                except Exception:
+                    pdf.set_xy(x, y0)
+                    pdf.set_font("helvetica", "I", 8)
+                    pdf.cell(W_CELL, H_CELL, "imagem indisponível", border=1, align="C")
+                if legenda:
+                    pdf.set_xy(x, y0 + H_CELL + 1)
+                    pdf.set_font("helvetica", "", 7.5)
+                    pdf.set_text_color(90)
+                    y_antes = pdf.get_y()
+                    pdf.multi_cell(W_CELL, 3.6, pdf_san(trunc(legenda, 130)), align="C")
+                    h_leg_max = max(h_leg_max, pdf.get_y() - y_antes)
+                    pdf.set_text_color(30)
+            pdf.set_y(y0 + H_CELL + h_leg_max + 5)
+        pdf.ln(1)
+
     pdf.ln(2)
     pdf.set_font("helvetica", "B", 11)
     pdf.set_text_color(22, 101, 96)
@@ -3134,6 +3205,107 @@ def gerar_pdf_laudo(tipo: str, numero: int, pet, dados: dict, conclusao: str,
     return bytes(pdf.output())
 
 
+LIMITE_IMG_LAUDO = 4_000_000   # ~4 MB por imagem (JPG)
+MAX_IMG_LAUDO = 10             # imagens por laudo
+
+
+def _anexar_imagens_laudo(laudo_id: int, ctx) -> int:
+    """Grava no banco as imagens JPG escolhidas no uploader do contexto `ctx` (0 = novo laudo)."""
+    up_files = st.session_state.get(f"ld_up_{ctx}") or []
+    if not up_files:
+        return 0
+    base = qdf("SELECT COALESCE(MAX(ordem), 0) m FROM laudo_imagens WHERE laudo_id = ?",
+               (int(laudo_id),)).iloc[0]["m"]
+    n_atual = qdf("SELECT COUNT(*) c FROM laudo_imagens WHERE laudo_id = ?",
+                  (int(laudo_id),)).iloc[0]["c"]
+    anexadas = 0
+    for i, f in enumerate(up_files):
+        if int(n_atual) + anexadas >= MAX_IMG_LAUDO:
+            st.warning(f"⚠️ Limite de {MAX_IMG_LAUDO} imagens por laudo — "
+                       "as demais não foram anexadas.")
+            break
+        b = f.getvalue()
+        if not b:
+            continue
+        if len(b) > LIMITE_IMG_LAUDO:
+            st.warning(f"⚠️ **{f.name}** tem mais de 4 MB e não foi anexada. "
+                       "Reduza a imagem e tente de novo.")
+            continue
+        leg = (st.session_state.get(f"ld_leg_{ctx}_{i}", "") or "").strip()
+        run("INSERT INTO laudo_imagens (laudo_id, ordem, legenda, dados) VALUES (?,?,?,?)",
+            (int(laudo_id), int(base) + i + 1, leg, sqlite3.Binary(b)))
+        anexadas += 1
+    if anexadas:
+        # limpa o uploader na próxima renderização (antes de o widget ser recriado)
+        st.session_state[f"_ldclr_{ctx}"] = True
+    return anexadas
+
+
+def _uploader_imagens(ctx, rotulo: str):
+    """Uploader de JPGs + campos de legenda. Retorna True se há arquivos escolhidos.
+
+    Deve ser chamado de forma consistente em todo rerun (mesmo ctx).
+    """
+    if st.session_state.pop(f"_ldclr_{ctx}", False):
+        st.session_state.pop(f"ld_up_{ctx}", None)
+        for k in [k for k in list(st.session_state) if str(k).startswith(f"ld_leg_{ctx}_")]:
+            st.session_state.pop(k, None)
+    files = st.file_uploader(rotulo, type=["jpg", "jpeg"], accept_multiple_files=True,
+                             key=f"ld_up_{ctx}",
+                             help="Somente JPG — as imagens entram em grade no PDF do laudo.")
+    if files:
+        st.caption(f"{len(files)} imagem(ns) — legenda opcional (sai embaixo da imagem no PDF):")
+        for i, f in enumerate(files):
+            c_img, c_leg = st.columns([1, 3])
+            c_img.image(f.getvalue(), width=110)
+            c_leg.text_input("Legenda", key=f"ld_leg_{ctx}_{i}",
+                             placeholder=f"Ex.: Fig. {i + 1} — fígado",
+                             label_visibility="collapsed")
+            if f.size and f.size > LIMITE_IMG_LAUDO:
+                c_leg.warning(f"⚠️ {f.name}: mais de 4 MB — não será anexada.")
+    return bool(files)
+
+
+def _secao_upload_novo_laudo(ctx):
+    """Bloco de imagens exibido no formulário de novo laudo / edição (fora do st.form)."""
+    st.markdown("**📷 Imagens do exame (JPG, opcional)**")
+    st.caption("Escolha as imagens agora — elas são **anexadas ao salvar o laudo**. "
+               "Depois de salvo, dá para adicionar/remover imagens na lista abaixo.")
+    _uploader_imagens(ctx, "Adicionar imagens JPG do exame")
+
+
+def _secao_imagens_laudo_salvo(laudo_id: int, numero: int):
+    """Gerencia as imagens de um laudo já salvo: ver, adicionar e excluir."""
+    imgs = qdf("SELECT id, legenda FROM laudo_imagens WHERE laudo_id = ? ORDER BY ordem, id",
+               (int(laudo_id),))
+    with st.container(border=True):
+        st.markdown(f"📷 **Imagens do laudo #{numero:04d}** ({len(imgs)} de {MAX_IMG_LAUDO})")
+        for _, im in imgs.iterrows():
+            c1, c2, c3 = st.columns([2, 3, 1])
+            try:
+                c1.image(_ler_blob("laudo_imagens", int(im["id"])), width=150)
+            except Exception as e:
+                c1.error(f"⚠️ Erro ao ler a imagem ({e})")
+            c2.caption((im["legenda"] or "").strip() or "_(sem legenda)_")
+            conf = c3.checkbox("Excluir?", key=f"limg_conf_{im['id']}")
+            if c3.button("🗑️ Excluir", key=f"limg_del_{im['id']}", disabled=not conf):
+                run("DELETE FROM laudo_imagens WHERE id = ?", (int(im["id"]),))
+                st.success("Imagem excluída.")
+                st.rerun()
+        if len(imgs) >= MAX_IMG_LAUDO:
+            st.info(f"Limite de {MAX_IMG_LAUDO} imagens por laudo atingido.")
+        else:
+            st.markdown("**➕ Adicionar imagens**")
+            tem = _uploader_imagens(f"s{laudo_id}",
+                                    "Escolher imagens JPG para este laudo")
+            if st.button("💾 Anexar imagens agora", key=f"ld_upsave_{laudo_id}",
+                         type="primary", disabled=not tem):
+                n = _anexar_imagens_laudo(laudo_id, f"s{laudo_id}")
+                if n:
+                    st.success(f"{n} imagem(ns) anexada(s) ao laudo #{numero:04d}!")
+                    st.rerun()
+
+
 def _render_laudo_pdf_widgets(pdf_bytes: bytes, numero: int, pet_nome: str, key_sufixo: str):
     st.download_button(
         f"⬇️ Baixar laudo nº {numero:04d} (PDF{' assinado' if assinatura_ativa() and st.session_state.get('cert_senha') else ''})",
@@ -3146,7 +3318,8 @@ def pagina_laudos():
     st.header("🔬 Laudos ultrassonográficos")
     st.caption("Modelos próprios de **ultrassom abdominal** e **ecocardiograma**. "
                "Os campos já vêm preenchidos com \"sem alterações\" — edite apenas o que encontrou "
-               "no exame. O laudo fica salvo no cadastro do pet e sai em PDF com seu carimbo "
+               "no exame. Você pode **anexar imagens JPG** do exame (saem em grade no PDF). "
+               "O laudo fica salvo no cadastro do pet e sai em PDF com seu carimbo "
                "(e assinatura digital ICP-Brasil, se estiver desbloqueada).")
 
     pets = qdf(
@@ -3257,6 +3430,7 @@ def pagina_laudos():
                                         ensure_ascii=False)
                 set_config("rec_cidade", cidade.strip() or "Penha/SC")
                 if editando:
+                    laudo_id = edit_id
                     numero = int(editando["numero"])
                     run("""UPDATE laudos SET data=?, dados=?, conclusao=?, recomendacoes=?,
                            veterinario=? WHERE id=?""",
@@ -3269,6 +3443,8 @@ def pagina_laudos():
                            VALUES (?,?,?,?,?,?,?,?)""",
                         (pid, numero, data_ex.isoformat(), tipo, dados_json,
                          conclusao.strip(), recomendacoes.strip(), veterinario.strip()))
+                    laudo_id = int(qdf("SELECT id FROM laudos WHERE numero = ?",
+                                       (numero,)).iloc[0]["id"])
                     if reg_hist:
                         rotulo = "Laudo US abdominal" if tipo == "abdominal" else "Laudo ecocardiograma"
                         run("""INSERT INTO historico (pet_id, data, tipo, veterinario, descricao)
@@ -3276,15 +3452,20 @@ def pagina_laudos():
                             (pid, data_ex.isoformat(), rotulo,
                              veterinario.strip() or (get_config("carimbo_nome", "") or ""),
                              f"{rotulo} nº {numero:04d}/{data_ex.year} — {trunc(conclusao, 380)}"))
+                _anexar_imagens_laudo(laudo_id, edit_id)
                 pdf_bytes = finalizar_pdf(gerar_pdf_laudo(
                     tipo, numero, pet,
                     json.loads(dados_json), conclusao, recomendacoes,
-                    data_ex.isoformat(), veterinario, cidade.strip()))
+                    data_ex.isoformat(), veterinario, cidade.strip(),
+                    imagens=ler_laudo_imagens(laudo_id)))
                 st.session_state["ld_pdf"] = pdf_bytes
                 st.session_state["ld_num"] = numero
                 st.session_state["ld_pet"] = pet["nome"]
                 st.session_state.pop("ld_edit", None)
                 st.rerun()
+
+        # ---- Imagens do exame (JPG) — fora do formulário; anexadas ao salvar --- #
+        _secao_upload_novo_laudo(edit_id)
 
     # ---- Laudos salvos do pet ------------------------------------------------ #
     with st.expander("📂 Laudos salvos deste pet"):
@@ -3307,7 +3488,8 @@ def pagina_laudos():
                     pdf_bytes = finalizar_pdf(gerar_pdf_laudo(
                         ld["tipo"], int(ld["numero"]), pet, json.loads(ld["dados"] or "{}"),
                         ld["conclusao"] or "", ld["recomendacoes"] or "", ld["data"],
-                        ld["veterinario"] or "", get_config("rec_cidade", "Penha/SC") or "Penha/SC"))
+                        ld["veterinario"] or "", get_config("rec_cidade", "Penha/SC") or "Penha/SC",
+                        imagens=ler_laudo_imagens(ld["id"])))
                     st.session_state["ld_pdf"] = pdf_bytes
                     st.session_state["ld_num"] = int(ld["numero"])
                     st.session_state["ld_pet"] = pet["nome"]
@@ -3317,10 +3499,12 @@ def pagina_laudos():
                     st.rerun()
                 conf_l = st.checkbox("Confirmo excluir", key=f"ld_conf_{ld['id']}")
                 if b3.button("🗑️ Excluir laudo", key=f"ld_del_{ld['id']}", disabled=not conf_l):
+                    run("DELETE FROM laudo_imagens WHERE laudo_id = ?", (int(ld["id"]),))
                     run("DELETE FROM laudos WHERE id = ?", (int(ld["id"]),))
                     st.session_state.pop("ld_edit", None)
                     st.success("Laudo excluído.")
                     st.rerun()
+                _secao_imagens_laudo_salvo(int(ld["id"]), int(ld["numero"]))
                 st.divider()
 
 
@@ -3547,7 +3731,7 @@ def main():
         apagar = st.checkbox("⚠️ Confirmo apagar TODOS os dados (exceto usuários)", key="conf_wipe")
         if st.button("🗑️ Apagar todos os dados", use_container_width=True, disabled=not apagar):
             for tabela in ("lancamentos", "vacinas", "agendamentos", "historico", "anexos",
-                           "laudos", "pets", "tutores"):
+                           "laudo_imagens", "laudos", "pets", "tutores"):
                 run(f"DELETE FROM {tabela}")
             st.sidebar.success("Banco de dados limpo! (usuários mantidos)")
             st.rerun()
