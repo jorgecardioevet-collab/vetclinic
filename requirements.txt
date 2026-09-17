@@ -1,3 +1,4 @@
 streamlit>=1.40,<2
 pandas>=2.0,<3
 fpdf2>=2.7,<3
+pyhanko>=0.25,<1

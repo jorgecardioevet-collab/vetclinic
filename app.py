@@ -149,6 +149,11 @@ CREATE TABLE IF NOT EXISTS anexos (
     dados      BLOB,
     criado_em  TEXT DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS config (
+    chave TEXT PRIMARY KEY,
+    valor BLOB
+);
 """
 
 
@@ -257,6 +262,27 @@ def qdf_local(sql: str, params: tuple = ()) -> pd.DataFrame:
     """SELECT forçado no banco LOCAL (usado na migração para a nuvem)."""
     with get_conn() as conn:
         return pd.read_sql_query(sql, conn, params=params)
+
+
+def get_config(chave: str, padrao=None):
+    """Lê um valor da tabela config (funciona no modo local e no modo nuvem)."""
+    try:
+        df = qdf("SELECT valor FROM config WHERE chave = ?", (chave,))
+        if df.empty:
+            return padrao
+        val = df.iloc[0]["valor"]
+        return padrao if val is None else val
+    except Exception:
+        return padrao
+
+
+def set_config(chave: str, valor):
+    """Grava (cria/atualiza) um valor na tabela config."""
+    run(
+        "INSERT INTO config (chave, valor) VALUES (?, ?) "
+        "ON CONFLICT(chave) DO UPDATE SET valor = excluded.valor",
+        (chave, valor),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1596,6 +1622,13 @@ def assinatura(pdf: FPDF):
     pdf.cell(0, 5, "________________________________________", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("helvetica", "", 9)
     pdf.cell(0, 5, pdf_san("Veterinário(a) responsável"), align="C", new_x="LMARGIN", new_y="NEXT")
+    if assinatura_ativa():
+        pdf.set_font("helvetica", "I", 7.5)
+        pdf.set_text_color(100)
+        pdf.cell(0, 4, pdf_san("Documento assinado digitalmente (ICP-Brasil) — verificável no painel de "
+                               "assinaturas do leitor de PDF ou em verificador.iti.br"),
+                 align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30)
 
 
 def dados_pet(pdf: FPDF, pet):
@@ -1726,11 +1759,250 @@ def gerar_pdf_agenda(dia_iso: str) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
+#  Assinatura digital A1 (e-CNPJ / ICP-Brasil)
+# --------------------------------------------------------------------------- #
+
+def assinatura_ativa() -> bool:
+    return get_config("cert_ativo", "0") == "1" and get_config("cert_pfx") is not None
+
+
+def _carregar_signer(pfx_dados: bytes, senha: str):
+    from pyhanko.sign import signers
+    return signers.SimpleSigner.load_pkcs12_data(pfx_dados, (), passphrase=senha.encode("utf-8"))
+
+
+def _extrair_info_cert(pfx_dados: bytes, senha: str):
+    """Lê titular, CNPJ/CPF e validade do certificado A1 (sem gravar a senha)."""
+    signer = _carregar_signer(pfx_dados, senha)
+    cert = signer.signing_cert
+    subj = cert.subject.native  # dict: {'common_name': ..., 'organization_name': ..., 'serial_number': ...}
+    titular = str(subj.get("common_name") or "")
+    cnpj = ""
+    for chave in ("2.16.76.1.3.4", "serial_number"):
+        val = str(subj.get(chave) or "")
+        digitos = "".join(c for c in val if c.isdigit())
+        if len(digitos) in (11, 14) and not cnpj:
+            cnpj = digitos
+    if ":" in titular:
+        base, doc = titular.rsplit(":", 1)
+        digitos = "".join(c for c in doc if c.isdigit())
+        if len(digitos) in (11, 14):
+            titular = base.strip()
+            cnpj = cnpj or digitos
+    if len(cnpj) == 14:
+        cnpj = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+    titular = titular or str(subj.get("organization_name") or "Certificado digital")
+    return titular, cnpj, cert.not_valid_after.replace(tzinfo=None)
+
+
+def carimbo_texto() -> str:
+    nome = (get_config("carimbo_nome", "") or "").strip()
+    crmv = (get_config("carimbo_crmv", "") or "").strip()
+    titular = (get_config("cert_titular", "") or "").strip() or "VetClinic"
+    linha1 = "  |  ".join(p for p in (nome, crmv) if p) or "Veterinário(a) responsável"
+    texto = f"{linha1}\nAssinado digitalmente por {titular} — ICP-Brasil"
+    return texto.encode("latin-1", "replace").decode("latin-1")
+
+
+def carimbo_preview(nome: str, crmv: str) -> str:
+    titular = (get_config("cert_titular", "") or "").strip() or "<titular do certificado>"
+    linha1 = "  |  ".join(p for p in (nome.strip(), crmv.strip()) if p) or "Veterinário(a) responsável"
+    return f"{linha1}\nAssinado digitalmente por {titular} — ICP-Brasil"
+
+
+def assinar_pdf_icp(pdf_dados: bytes, pfx_dados: bytes, senha: str, texto: str) -> bytes:
+    """Aplica assinatura PAdES (ICP-Brasil) no PDF e devolve os bytes assinados."""
+    import io
+    from pyhanko import stamp
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    from pyhanko.sign import fields, signers
+
+    signer = _carregar_signer(pfx_dados, senha)
+    entrada = io.BytesIO(pdf_dados)
+    escritor = IncrementalPdfFileWriter(entrada)
+    saida = io.BytesIO()
+    assinador = signers.PdfSigner(
+        signers.PdfSignatureMetadata(field_name="AssinaturaDigital"),
+        signer=signer,
+        stamp_style=stamp.TextStampStyle(stamp_text=texto),
+        new_field_spec=fields.SigFieldSpec(
+            "AssinaturaDigital", box=(285, 24, 570, 78), on_page=-1
+        ),
+    )
+    assinador.sign_pdf(escritor, output=saida)
+    return saida.getvalue()
+
+
+def finalizar_pdf(pdf_dados: bytes) -> bytes:
+    """Assina o PDF se a assinatura estiver ativa e desbloqueada na sessão."""
+    if assinatura_ativa() and st.session_state.get("cert_senha"):
+        try:
+            return assinar_pdf_icp(pdf_dados, get_config("cert_pfx"),
+                                   st.session_state["cert_senha"], carimbo_texto())
+        except Exception as e:
+            st.warning(f"⚠️ Não foi possível assinar digitalmente ({e}). Gerando o PDF sem assinatura.")
+    return pdf_dados
+
+
+def relatorios_gate_assinatura():
+    """Bloco de desbloqueio da assinatura exibido no topo da página de relatórios."""
+    if not assinatura_ativa():
+        return
+    if st.session_state.get("cert_senha"):
+        titular = get_config("cert_titular", "") or "titular do certificado"
+        st.caption(f"🔏 **Assinatura digital ATIVA** — os PDFs saem assinados com o certificado "
+                   f"ICP-Brasil de **{titular}**.")
+        return
+    with st.container(border=True):
+        st.markdown("##### 🔏 Assinatura digital (ICP-Brasil) disponível")
+        st.caption("Informe a senha do certificado A1 **uma vez por sessão** para assinar os PDFs.")
+        senha = st.text_input("Senha do certificado", type="password", key="unlock_cert")
+        if senha:
+            try:
+                _carregar_signer(get_config("cert_pfx"), senha)
+            except Exception:
+                st.error("❌ Senha incorreta (ou arquivo de certificado inválido).")
+            else:
+                st.session_state["cert_senha"] = senha
+                st.success("✅ Certificado desbloqueado — os PDFs desta sessão sairão assinados!")
+                st.rerun()
+
+
+def pagina_assinatura():
+    st.header("🔏 Assinatura digital A1 (e-CNPJ)")
+    st.caption(
+        "Use seu certificado digital A1 para assinar automaticamente **todos os PDFs** gerados "
+        "pelo sistema — receituários, atestados e relatórios saem com validade jurídica "
+        "(assim como em plataformas como Memed), verificáveis em qualquer leitor de PDF."
+    )
+
+    tem_cert = get_config("cert_pfx") is not None
+
+    if tem_cert:
+        titular = get_config("cert_titular", "") or "—"
+        cnpj = get_config("cert_cnpj", "") or "—"
+        val_str = get_config("cert_validade", "") or "—"
+        nome_arq = get_config("cert_arquivo", "") or "certificado.pfx"
+        try:
+            dias = (datetime.strptime(val_str, "%d/%m/%Y").date() - date.today()).days
+        except Exception:
+            dias = None
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Titular", titular[:28])
+        c2.metric("CNPJ", cnpj or "—")
+        c3.metric("Válido até", val_str)
+        if dias is not None and dias < 0:
+            st.error("⛔ **Certificado VENCIDO!** Renove com a certificadora e reenvie o arquivo abaixo.")
+        elif dias is not None and dias <= 30:
+            st.warning(f"⚠️ Atenção: seu certificado vence em **{dias} dias** — providencie a renovação.")
+        else:
+            st.success(f"✅ Certificado instalado: `{nome_arq}`  ·  válido por mais **{dias} dias**")
+    else:
+        st.info("Nenhum certificado cadastrado. Envie seu arquivo **.pfx** (ou **.p12**) abaixo ⬇️")
+
+    with st.expander("📤 " + ("Reenviar / trocar certificado" if tem_cert else "Enviar certificado"),
+                     expanded=not tem_cert):
+        with st.form("form_cert", clear_on_submit=True):
+            arq = st.file_uploader("Arquivo do certificado *", type=["pfx", "p12"])
+            senha = st.text_input("Senha do certificado *", type="password",
+                                  help="A senha NUNCA é salva — só fica na memória da sua sessão no navegador.")
+            enviado = st.form_submit_button("💾 Validar e salvar certificado", type="primary")
+        if enviado:
+            if not arq or not senha:
+                st.error("Selecione o arquivo do certificado e informe a senha.")
+            else:
+                dados = arq.getvalue()
+                try:
+                    t_tit, t_cnpj, t_val = _extrair_info_cert(dados, senha)
+                except Exception:
+                    st.error("❌ Não foi possível abrir o certificado. Verifique se é um arquivo "
+                             "**.pfx/.p12** válido e se a senha está correta.")
+                else:
+                    set_config("cert_pfx", dados)
+                    set_config("cert_arquivo", arq.name or "certificado.pfx")
+                    set_config("cert_titular", t_tit)
+                    set_config("cert_cnpj", t_cnpj)
+                    set_config("cert_validade", t_val.strftime("%d/%m/%Y"))
+                    set_config("cert_ativo", "1")
+                    st.session_state["cert_senha"] = senha
+                    st.success(f"✅ Certificado de **{t_tit}** instalado e assinatura ativada!")
+                    st.rerun()
+
+    if tem_cert:
+        st.divider()
+        ativo = assinatura_ativa()
+        novo = st.toggle("🔏 Assinar automaticamente **todos os PDFs** do sistema", value=ativo)
+        if novo != ativo:
+            set_config("cert_ativo", "1" if novo else "0")
+            st.success("✅ Assinatura automática ATIVADA." if novo else "Assinatura automática desativada.")
+            st.rerun()
+
+        st.subheader("✍️ Carimbo visual da assinatura")
+        st.caption("Este texto aparece carimbado no rodapé dos PDFs, junto da assinatura criptográfica.")
+        with st.form("form_carimbo"):
+            c1, c2 = st.columns(2)
+            nome = c1.text_input("Nome do(a) veterinário(a)",
+                                 value=get_config("carimbo_nome", "") or "",
+                                 placeholder="Ex.: Dr. João Alves")
+            crmv = c2.text_input("CRMV", value=get_config("carimbo_crmv", "") or "",
+                                 placeholder="Ex.: CRMV-SC 00000")
+            if nome.strip() or crmv.strip():
+                st.caption("**Prévia do carimbo:**")
+                st.code(carimbo_preview(nome, crmv), language=None)
+            salvar_txt = st.form_submit_button("💾 Salvar carimbo", type="primary")
+        if salvar_txt:
+            set_config("carimbo_nome", nome.strip())
+            set_config("carimbo_crmv", crmv.strip())
+            st.success("✅ Carimbo atualizado!")
+            st.rerun()
+
+        with st.expander("ℹ️ Perguntas frequentes"):
+            st.markdown(
+                """
+**A senha do certificado fica salva no sistema?**
+Não. Por segurança, a senha fica apenas na memória do seu navegador enquanto a aba está
+aberta. A cada nova sessão, você a informa **uma única vez** na página 📄 Relatórios e
+todos os PDFs gerados em seguida já saem assinados.
+
+**Onde o certificado fica guardado?**
+O arquivo do certificado fica no seu próprio banco de dados (Turso), junto dos demais
+dados da clínica. Guarde também uma cópia de segurança do arquivo original fora do sistema.
+
+**A assinatura tem validade jurídica?**
+Sim — usa o padrão **ICP-Brasil (PAdES)**. Verifique qualquer PDF em
+[verificador.iti.br](https://verificador.iti.br/) ou no painel de assinaturas do
+Adobe Acrobat Reader.
+
+**Certificado A1 vence em 1 ano. E depois?**
+O app avisa quando faltar 30 dias. É só renovar com a certificadora (Serasa, Soluti,
+Certisign, Valid...) e reenviar o novo arquivo aqui. Os PDFs já assinados continuam válidos.
+
+**Posso desligar sem remover o certificado?**
+Sim — use o botão liga/desliga *"Assinar automaticamente todos os PDFs"* acima.
+"""
+            )
+
+        st.divider()
+        with st.expander("🗑️ Remover certificado"):
+            st.caption("Remove o arquivo do certificado do banco de dados. "
+                       "Os PDFs voltam a sair sem assinatura digital.")
+            conf = st.checkbox("Confirmo a remoção do certificado", key="conf_rm_cert")
+            if st.button("Remover certificado definitivamente", disabled=not conf):
+                for k in ("cert_pfx", "cert_arquivo", "cert_titular", "cert_cnpj", "cert_validade"):
+                    run("DELETE FROM config WHERE chave = ?", (k,))
+                set_config("cert_ativo", "0")
+                st.session_state.pop("cert_senha", None)
+                st.success("Certificado removido.")
+                st.rerun()
+
+
+# --------------------------------------------------------------------------- #
 #  Página: Relatórios
 # --------------------------------------------------------------------------- #
 
 def pagina_relatorios():
     st.header("📄 Relatórios em PDF")
+    relatorios_gate_assinatura()
     tipo = st.radio(
         "Tipo de relatório",
         ["Carteirinha de vacinação (pet)", "Histórico de atendimentos (pet)",
@@ -1756,13 +2028,13 @@ def pagina_relatorios():
         if tipo == "Carteirinha de vacinação (pet)":
             n = qdf("SELECT COUNT(*) c FROM vacinas WHERE pet_id = ?", (pid,)).iloc[0]["c"]
             st.caption(f"{n} vacina(s) registrada(s) para este pet.")
-            dados = gerar_pdf_carteirinha(pid)
+            dados = finalizar_pdf(gerar_pdf_carteirinha(pid))
             st.download_button("⬇️ Baixar carteirinha em PDF", dados,
                                f"carteirinha_{nome}.pdf", "application/pdf", type="primary")
         else:
             n = qdf("SELECT COUNT(*) c FROM historico WHERE pet_id = ?", (pid,)).iloc[0]["c"]
             st.caption(f"{n} atendimento(s) registrado(s) para este pet.")
-            dados = gerar_pdf_historico(pid)
+            dados = finalizar_pdf(gerar_pdf_historico(pid))
             st.download_button("⬇️ Baixar histórico em PDF", dados,
                                f"historico_{nome}.pdf", "application/pdf", type="primary")
 
@@ -1773,13 +2045,13 @@ def pagina_relatorios():
             "Mês de referência", opcoes,
             format_func=lambda m: datetime.strptime(m, "%Y-%m").strftime("%m/%Y"),
         )
-        dados = gerar_pdf_financeiro(mes)
+        dados = finalizar_pdf(gerar_pdf_financeiro(mes))
         st.download_button("⬇️ Baixar relatório financeiro", dados,
                            f"financeiro_{mes}.pdf", "application/pdf", type="primary")
 
     else:  # Agenda do dia
         dia = st.date_input("Dia", value=date.today(), format="DD/MM/YYYY")
-        dados = gerar_pdf_agenda(dia.isoformat())
+        dados = finalizar_pdf(gerar_pdf_agenda(dia.isoformat()))
         st.download_button("⬇️ Baixar agenda em PDF", dados,
                            f"agenda_{dia.isoformat()}.pdf", "application/pdf", type="primary")
 
@@ -2263,7 +2535,7 @@ def main():
     opcoes = ["🏠 Início", "📅 Agenda", "💉 Vacinas", "👤 Tutores", "🐾 Pets",
               "📋 Histórico", "📎 Exames", "💰 Financeiro", "📄 Relatórios"]
     if eu["papel"] == "admin":
-        opcoes += ["🔐 Usuários", "☁️ Nuvem"]
+        opcoes += ["🔐 Usuários", "🔏 Assinatura", "☁️ Nuvem"]
     pagina = st.sidebar.radio("Menu", opcoes)
 
     st.sidebar.divider()
@@ -2297,6 +2569,8 @@ def main():
         pagina_financeiro()
     elif pagina == "🔐 Usuários":
         pagina_usuarios()
+    elif pagina == "🔏 Assinatura":
+        pagina_assinatura()
     elif pagina == "☁️ Nuvem":
         pagina_nuvem()
     else:
