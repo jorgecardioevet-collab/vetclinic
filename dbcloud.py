@@ -24,7 +24,7 @@ def _enc_valor(v):
     if isinstance(v, bool):
         return {"type": "integer", "value": "1" if v else "0"}
     if isinstance(v, (bytes, bytearray, memoryview)):
-        return {"type": "blob", "value": base64.b64encode(bytes(v)).decode()}
+        return {"type": "blob", "base64": base64.b64encode(bytes(v)).decode()}
     if isinstance(v, float):
         return {"type": "float", "value": float(v)}
     try:
@@ -38,6 +38,8 @@ def _enc_valor(v):
 def _dec_valor(cell):
     """Converte uma célula da resposta da API de volta para Python."""
     tipo = cell.get("type")
+    if tipo == "blob":
+        return base64.b64decode(cell.get("base64") or "")
     valor = cell.get("value")
     if tipo == "null" or valor is None:
         return None
@@ -45,8 +47,6 @@ def _dec_valor(cell):
         return int(valor)
     if tipo == "float":
         return float(valor)
-    if tipo == "blob":
-        return base64.b64decode(valor)
     return valor
 
 
