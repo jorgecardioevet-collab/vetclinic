@@ -44,6 +44,35 @@ SUGESTOES_VACINAS = {
     "Gato": "V4/V5 (múltipla), Antirrábica, FeLV",
 }
 
+# Serviços iniciais sugeridos (criados na 1ª vez que abrir o Financeiro — preços editáveis)
+SERVICOS_SEED = [
+    ("Consulta clínica", "Consulta", 180.0),
+    ("Retorno (reavaliação)", "Consulta", 90.0),
+    ("Ecocardiograma (ECO)", "Exame", 450.0),
+    ("Eletrocardiograma (ECG)", "Exame", 150.0),
+    ("Holter 24h", "Exame", 550.0),
+    ("MAPA (pressão ambulatorial)", "Exame", 500.0),
+    ("Raio-X de tórax", "Exame", 250.0),
+    ("Ultrassom abdominal", "Exame", 350.0),
+    ("Hemograma completo", "Exame", 90.0),
+    ("Bioquímica sérica", "Exame", 120.0),
+    ("Vacina múltipla", "Vacina", 130.0),
+    ("Vacina antirrábica", "Vacina", 90.0),
+    ("Microchip", "Outros", 180.0),
+    ("Atestado sanitário", "Outros", 80.0),
+    ("Castração", "Cirurgia", 900.0),
+]
+
+
+def _seed_servicos():
+    """Insere os serviços sugeridos na primeira vez (tabela vazia)."""
+    try:
+        if int(qdf("SELECT COUNT(*) c FROM servicos").iloc[0]["c"]) == 0:
+            for nome, cat, preco in SERVICOS_SEED:
+                run("INSERT INTO servicos (nome, categoria, preco) VALUES (?,?,?)", (nome, cat, preco))
+    except Exception:
+        pass
+
 # --------------------------------------------------------------------------- #
 #  Banco de dados
 # --------------------------------------------------------------------------- #
@@ -153,6 +182,15 @@ CREATE TABLE IF NOT EXISTS anexos (
 CREATE TABLE IF NOT EXISTS config (
     chave TEXT PRIMARY KEY,
     valor BLOB
+);
+
+CREATE TABLE IF NOT EXISTS servicos (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome       TEXT NOT NULL,
+    categoria  TEXT,
+    preco      REAL DEFAULT 0,
+    ativo      INTEGER DEFAULT 1,
+    criado_em  TEXT DEFAULT (datetime('now', 'localtime'))
 );
 """
 
@@ -1574,22 +1612,109 @@ def pagina_financeiro():
     c2.metric("📉 Despesas", fmt_moeda(despesas))
     c3.metric("💵 Saldo do mês", fmt_moeda(receitas - despesas))
 
+    # ---- Tabela de serviços e valores --------------------------------------- #
+    with st.expander("🩺 Tabela de serviços e valores"):
+        _seed_servicos()
+        sv = qdf("SELECT id, nome, categoria, preco, ativo FROM servicos ORDER BY ativo DESC, nome")
+        n_ativos = int((sv["ativo"] == 1).sum()) if not sv.empty else 0
+        st.caption(f"{n_ativos} serviço(s) ativo(s). Os preços iniciais são **sugestões editáveis** — ajuste para os valores da sua clínica.")
+        if not sv.empty:
+            view = sv.copy()
+            view["Situação"] = view["ativo"].map({0: "⏸ Inativo", 1: "✅ Ativo"})
+            st.dataframe(
+                view[["nome", "categoria", "preco", "Situação"]],
+                hide_index=True, use_container_width=True,
+                column_config={
+                    "nome": "Serviço", "categoria": "Categoria",
+                    "preco": st.column_config.NumberColumn("Preço", format="R$ %.2f"),
+                },
+            )
+
+        with st.container(border=True):
+            st.markdown("**➕ Novo serviço**")
+            c1, c2, c3 = st.columns([4, 2, 2])
+            n_nome = c1.text_input("Nome do serviço *", placeholder="Ex.: Doppler renal", key="sv_nome_novo")
+            n_cat = c2.selectbox("Categoria", CATEGORIAS["Receita"], key="sv_cat_novo")
+            n_preco = c3.number_input("Preço (R$)", min_value=0.0, step=10.0, format="%.2f", key="sv_preco_novo")
+            if st.button("💾 Adicionar serviço", type="primary", key="btn_sv_novo"):
+                if not n_nome.strip():
+                    st.error("Informe o nome do serviço.")
+                else:
+                    run("INSERT INTO servicos (nome, categoria, preco) VALUES (?,?,?)",
+                        (n_nome.strip(), n_cat, float(n_preco)))
+                    st.success(f"Serviço **{n_nome.strip()}** adicionado!")
+                    st.rerun()
+
+        if not sv.empty:
+            with st.container(border=True):
+                st.markdown("**✏️ Editar, pausar ou excluir serviço**")
+                op_sv = {f"{r['nome']} — {fmt_moeda(r['preco'])} (#{r['id']})": int(r["id"])
+                         for _, r in sv.iterrows()}
+                sel_sv = st.selectbox("Selecione o serviço", list(op_sv.keys()), key="sv_sel_edit")
+                sid = op_sv[sel_sv]
+                row = sv[sv["id"] == sid].iloc[0]
+                e1, e2, e3 = st.columns([4, 2, 2])
+                e_nome = e1.text_input("Nome", value=row["nome"], key=f"sv_enome_{sid}")
+                e_cat = e2.selectbox("Categoria", CATEGORIAS["Receita"],
+                                     index=CATEGORIAS["Receita"].index(row["categoria"])
+                                     if row["categoria"] in CATEGORIAS["Receita"] else 0,
+                                     key=f"sv_ecat_{sid}")
+                e_preco = e3.number_input("Preço (R$)", min_value=0.0, value=float(row["preco"] or 0),
+                                          step=10.0, format="%.2f", key=f"sv_epreco_{sid}")
+                e_ativo = st.checkbox("Serviço ativo (aparece no preenchimento rápido)",
+                                      value=bool(row["ativo"]), key=f"sv_eativo_{sid}")
+                b1, b2, b3 = st.columns([2, 2, 3])
+                if b1.button("💾 Salvar alterações", key=f"sv_save_{sid}", type="primary"):
+                    if not e_nome.strip():
+                        st.error("O nome não pode ficar vazio.")
+                    else:
+                        run("UPDATE servicos SET nome=?, categoria=?, preco=?, ativo=? WHERE id=?",
+                            (e_nome.strip(), e_cat, float(e_preco), 1 if e_ativo else 0, sid))
+                        st.success("Serviço atualizado!")
+                        st.rerun()
+                conf_sv = st.checkbox("Confirmo a exclusão deste serviço", key=f"sv_conf_{sid}")
+                if b2.button("🗑️ Excluir", key=f"sv_del_{sid}", disabled=not conf_sv):
+                    run("DELETE FROM servicos WHERE id = ?", (sid,))
+                    st.success("Serviço excluído.")
+                    st.rerun()
+
     pets = qdf(
         """SELECT p.id, p.nome, t.nome AS tutor FROM pets p
            JOIN tutores t ON t.id = p.tutor_id ORDER BY p.nome"""
     )
 
     # ---- Novo lançamento ------------------------------------------------------ #
-    with st.expander("➕ Novo lançamento"):
+    with st.expander("➕ Novo lançamento", expanded=True):
         tipo = st.radio("Tipo", ["Receita", "Despesa"], horizontal=True, key="tipo_novo_lanc")
+        sv_ativos = qdf("SELECT id, nome, preco, categoria FROM servicos WHERE ativo = 1 ORDER BY nome")
+        if tipo == "Receita" and not sv_ativos.empty:
+            sv_lbl = ["— Escolher manualmente —"] + [
+                f"{r['nome']} — {fmt_moeda(r['preco'])}" for _, r in sv_ativos.iterrows()
+            ]
+            sel_aplica = st.selectbox("🩺 Aplicar serviço da tabela (preenche descrição e valor)",
+                                      sv_lbl, key="nl_sel_servico")
+            if sel_aplica != "— Escolher manualmente —":
+                row_sv = sv_ativos.iloc[sv_lbl.index(sel_aplica) - 1]
+                st.session_state["nl_default_desc"] = row_sv["nome"]
+                st.session_state["nl_default_valor"] = float(row_sv["preco"] or 0)
+                st.session_state["nl_default_cat"] = (
+                    row_sv["categoria"] if row_sv["categoria"] in CATEGORIAS["Receita"] else "Consulta"
+                )
         with st.form("form_novo_lancamento", clear_on_submit=True):
             c1, c2, c3 = st.columns(3)
             data = c1.date_input("Data *", value=hoje, min_value=date(2020, 1, 1), format="DD/MM/YYYY")
-            categoria = c2.selectbox("Categoria", CATEGORIAS[tipo])
+            cat_opts = CATEGORIAS[tipo]
+            cat_def = st.session_state.get("nl_default_cat")
+            categoria = c2.selectbox("Categoria", cat_opts,
+                                     index=cat_opts.index(cat_def) if cat_def in cat_opts else 0)
             pagamento = c3.selectbox("Forma de pagamento", FORMAS_PAGAMENTO)
-            descricao = st.text_input("Descrição *", placeholder="Ex.: Consulta de rotina, compra de ração…")
+            descricao = st.text_input(
+                "Descrição *", value=st.session_state.get("nl_default_desc", ""),
+                placeholder="Ex.: Consulta de rotina, compra de ração…")
             c4, c5 = st.columns(2)
-            valor = c4.number_input("Valor (R$) *", min_value=0.0, value=None, step=10.0, format="%.2f")
+            valor = c4.number_input("Valor (R$) *", min_value=0.0,
+                                    value=st.session_state.get("nl_default_valor", 0.0) or None,
+                                    step=10.0, format="%.2f")
             op = {"— Não vincular —": None}
             op.update({f"{r['nome']} — {r['tutor']}": r["id"] for _, r in pets.iterrows()})
             pet_lbl = c5.selectbox("Vincular a um pet (opcional)", list(op.keys()))
@@ -1606,7 +1731,9 @@ def pagina_financeiro():
                         (data.isoformat(), tipo, categoria, descricao.strip(),
                          float(valor), pagamento, op[pet_lbl]),
                     )
-                    st.success("Lançamento salvo!")
+                    for k in ("nl_default_desc", "nl_default_valor", "nl_default_cat"):
+                        st.session_state.pop(k, None)
+                    st.success(f"Lançamento salvo: **{descricao.strip()}** — {fmt_moeda(float(valor))}")
                     st.rerun()
 
     # ---- Lançamentos do mês ---------------------------------------------------- #
