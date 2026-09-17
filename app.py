@@ -877,6 +877,192 @@ def pagina_pets():
             run("DELETE FROM pets WHERE id = ?", (pid,))
             st.success(f"Pet **{row['nome']}** excluído.")
             st.rerun()
+        return
+
+    # ----------------------------------------------------------------- #
+    #  📜 Emitir receita (simples ou controlada)
+    # ----------------------------------------------------------------- #
+    pid = pagina_receita_pet(df, tutores)
+
+
+# --------------------------------------------------------------------------- #
+#  Receitas (simples e controlada)
+# --------------------------------------------------------------------------- #
+
+def gerar_pdf_receita(num: int, controlada: bool, pet, meds, obs: str,
+                      data_iso: str, cidade: str) -> bytes:
+    """Gera receituário (simples ou de controle especial) em PDF."""
+    import re
+    ano = datetime.strptime(data_iso, "%Y-%m-%d").year
+    if controlada:
+        pdf = novo_pdf("RECEITA DE CONTROLE ESPECIAL",
+                       subtitulo=f"Nº {num:04d}/{ano}  ·  Portaria SVS/MS nº 344/98")
+    else:
+        pdf = novo_pdf("Receituário Veterinário", subtitulo=f"Nº {num:04d}/{ano}")
+    dados_pet(pdf, pet)
+
+    if controlada:
+        pdf.set_font("helvetica", "B", 10)
+        pdf.set_text_color(22, 101, 96)
+        pdf.cell(0, 6, "IDENTIFICAÇÃO DO COMPRADOR (TUTOR)", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30)
+        pdf_campo(pdf, "Nome:", pet["tutor"] or "—")
+        if pet.get("cpf"):
+            pdf_campo(pdf, "CPF:", pet["cpf"])
+        if pet.get("endereco"):
+            pdf_campo(pdf, "Endereço:", pet["endereco"])
+        pdf.ln(2)
+        if pet["nascimento"]:
+            pass
+
+    pdf.set_font("helvetica", "B", 11)
+    pdf.set_text_color(22, 101, 96)
+    pdf.cell(0, 7, "MEDICAMENTO(S) PRESCRITO(S)" if controlada else "PRESCRIÇÃO",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(30)
+    for i, (nome, apres, qtd, poso) in enumerate(meds, 1):
+        pdf.set_font("helvetica", "B", 10.5)
+        linha1 = f"{i}. {nome}" + (f"  —  {apres}" if apres else "")
+        pdf.multi_cell(0, 6, pdf_san(linha1), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("helvetica", "I", 9.5)
+        pdf.set_text_color(70)
+        if qtd:
+            qtd_txt = str(qtd)
+            if controlada:
+                m = re.match(r"\s*(\d+)", qtd_txt)
+                if m:
+                    qtd_txt = f"{qtd_txt}  ({_ext_ate_999(int(m.group(1)))})"
+            pdf.multi_cell(0, 5, pdf_san(f"     Quantidade: {qtd_txt}"), new_x="LMARGIN", new_y="NEXT")
+        if poso:
+            pdf.multi_cell(0, 5, pdf_san(f"     Uso: {poso}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30)
+        pdf.ln(2)
+    pdf.ln(2)
+
+    if obs.strip():
+        pdf.set_font("helvetica", "B", 10)
+        pdf.cell(0, 6, "Orientações / Observações:", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("helvetica", "", 9.5)
+        pdf.multi_cell(0, 5, pdf_san(obs.strip()), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+
+    if controlada:
+        pdf.set_font("helvetica", "I", 8)
+        pdf.set_text_color(150, 40, 40)
+        pdf.multi_cell(0, 5, pdf_san(
+            "Emitida em 2 vias — a farmácia DEVERÁ RETER a 1ª via, conforme a Portaria SVS/MS nº 344/98. "
+            "É vedada a dispensação de medicamentos sujeitos a controle especial sem a apresentação desta receita."
+        ), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30)
+        pdf.ln(2)
+
+    d = datetime.strptime(data_iso, "%Y-%m-%d")
+    meses = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho",
+             "agosto", "setembro", "outubro", "novembro", "dezembro"]
+    pdf.set_font("helvetica", "", 10)
+    pdf.cell(0, 6, pdf_san(f"{(cidade or 'Penha/SC')}, {d.day} de {meses[d.month - 1]} de {d.year}."),
+             new_x="LMARGIN", new_y="NEXT")
+    assinatura(pdf)
+    return bytes(pdf.output())
+
+
+def pagina_receita_pet(df, tutores):
+    """Seção 📜 Emitir receita, exibida ao final da página de Pets."""
+    if df.empty:
+        return None
+    st.divider()
+    with st.expander("📜 Emitir receita (simples ou controlada)"):
+        op = {f"{r['nome']} — {r['tutor']} (#{r['id']})": int(r["id"]) for _, r in df.iterrows()}
+        sel = st.selectbox("Pet que receberá a receita", list(op.keys()), key="rec_pet_sel")
+        pid = op[sel]
+        tipo = st.radio("Tipo de receita", ["📄 Simples", "🔒 Controlada (Portaria 344/98)"],
+                        horizontal=True, key="rec_tipo")
+        ctrl = tipo.startswith("🔒")
+
+        pet = qdf(
+            """SELECT p.*, t.nome AS tutor, t.telefone, t.cpf, t.endereco
+               FROM pets p JOIN tutores t ON t.id = p.tutor_id WHERE p.id = ?""",
+            (pid,),
+        ).iloc[0]
+
+        if ctrl and (not pet["cpf"] or not pet["endereco"]):
+            st.warning("⚠️ Receita controlada precisa de **CPF e endereço do tutor**. "
+                       "Confira/complete abaixo (vale atualizar também no cadastro do tutor).")
+
+        with st.form(f"form_receita_{pid}_{'c' if ctrl else 's'}"):
+            meds = []
+            st.caption("Itens da prescrição (preencha somente os necessários)")
+            for i in range(4):
+                c1, c2, c3 = st.columns([4, 3, 2])
+                nm = c1.text_input(f"Medicamento {i + 1}", key=f"rec_nm{i}",
+                                   placeholder="Ex.: Amoxicilina" if i == 0 else "")
+                ap = c2.text_input(f"Apresentação {i + 1}", key=f"rec_ap{i}",
+                                   placeholder="250 mg — comprimido" if i == 0 else "",
+                                   label_visibility="visible")
+                qd = c3.text_input(f"Qtd. {i + 1}", key=f"rec_qd{i}",
+                                   placeholder="14 comp." if i == 0 else "")
+                ps = st.text_area(f"Posologia {i + 1}", key=f"rec_ps{i}", height=48,
+                                  placeholder="1 comp. via oral a cada 12h por 7 dias" if i == 0 else "")
+                if nm.strip():
+                    meds.append((nm.strip(), ap.strip(), qd.strip(), ps.strip()))
+                st.markdown("")  # respiro visual
+
+            if ctrl:
+                c4, c5 = st.columns(2)
+                t_cpf = c4.text_input("CPF do tutor *", value=pet["cpf"] or "")
+                t_end = c5.text_input("Endereço do tutor *", value=pet["endereco"] or "")
+            else:
+                t_cpf = t_end = ""
+
+            obs = st.text_area("Orientações / observações (opcional)", height=60)
+            c6, c7 = st.columns(2)
+            data_rec = c6.date_input("Data", value=date.today(), format="DD/MM/YYYY")
+            cid_rec = c7.text_input("Local (cidade/UF)",
+                                    value=get_config("rec_cidade", "Penha/SC") or "Penha/SC")
+            reg_hist = st.checkbox("Registrar também no histórico do pet", value=True)
+            gerar = st.form_submit_button("📄 Gerar receita", type="primary")
+
+        if gerar:
+            if not meds:
+                st.error("Informe pelo menos o **Medicamento 1** com seu uso.")
+            elif ctrl and (not t_cpf.strip() or not t_end.strip()):
+                st.error("Receita controlada exige **CPF e endereço do tutor**.")
+            else:
+                if ctrl:
+                    pet = dict(pet)
+                    pet["cpf"] = t_cpf.strip()
+                    pet["endereco"] = t_end.strip()
+                num = proximo_numero("receita_seq")
+                set_config("rec_cidade", cid_rec.strip() or "Penha/SC")
+                pdf_bytes = finalizar_pdf(gerar_pdf_receita(
+                    num, ctrl, pet, meds, obs, data_rec.isoformat(), cid_rec.strip()))
+                st.session_state["rec_pdf"] = pdf_bytes
+                st.session_state["rec_num"] = num
+                st.session_state["rec_pet"] = pet["nome"]
+                if reg_hist:
+                    resumo = "Receita" + (" de CONTROLE ESPECIAL" if ctrl else " simples") + \
+                             f" nº {num:04d}/{data_rec.year} — " + \
+                             "; ".join(f"{n} {a}".strip() for n, a, _, _ in meds)
+                    vet = (get_config("carimbo_nome", "") or
+                           st.session_state.usuario.get("nome", "")).strip()
+                    run(
+                        "INSERT INTO historico (pet_id, data, tipo, veterinario, descricao) VALUES (?,?,?,?,?)",
+                        (pid, data_rec.isoformat(),
+                         "Receita" + (" (controlada)" if ctrl else ""), vet, resumo[:480]),
+                    )
+                if ctrl and (not qdf("SELECT cpf FROM tutores WHERE id = ?", (pet["tutor_id"],)).iloc[0]["cpf"]):
+                    run("UPDATE tutores SET cpf = COALESCE(cpf, ?), endereco = COALESCE(endereco, ?) WHERE id = ?",
+                        (t_cpf.strip(), t_end.strip(), pet["tutor_id"]))
+                st.success(f"✅ Receita nº {num:04d} gerada" +
+                           (" e registrada no histórico!" if reg_hist else "!"))
+
+        if st.session_state.get("rec_pdf"):
+            st.download_button(
+                f"⬇️ Baixar receita nº {st.session_state['rec_num']:04d} (PDF)",
+                st.session_state["rec_pdf"],
+                f"receita_{st.session_state['rec_num']:04d}_{st.session_state['rec_pet'].lower().replace(' ', '_')}.pdf",
+                "application/pdf", type="primary")
+    return pid
 
 
 # --------------------------------------------------------------------------- #
@@ -1692,8 +1878,14 @@ def assinatura(pdf: FPDF):
     pdf.ln(14)
     pdf.set_font("helvetica", "", 10)
     pdf.cell(0, 5, "________________________________________", align="C", new_x="LMARGIN", new_y="NEXT")
+    nome = (get_config("carimbo_nome", "") or "").strip()
+    crmv = (get_config("carimbo_crmv", "") or "").strip()
+    if nome or crmv:
+        rotulo = ("  —  ".join(p for p in (nome, crmv) if p))
+    else:
+        rotulo = "Veterinário(a) responsável"
     pdf.set_font("helvetica", "", 9)
-    pdf.cell(0, 5, pdf_san("Veterinário(a) responsável"), align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, pdf_san(rotulo), align="C", new_x="LMARGIN", new_y="NEXT")
     if assinatura_ativa():
         pdf.set_font("helvetica", "I", 7.5)
         pdf.set_text_color(100)
@@ -2164,7 +2356,7 @@ def gerar_pdf_recibo(num: int, recebido_de: str, valor: float, servico: str,
     pdf.set_y(y + 20)
     pdf.set_text_color(60)
     pdf.set_font("helvetica", "I", 9.5)
-    pdf.multi_cell(0, 5, pdf_san(f"Correspondente a: {valor_por_extenso(valor)}"))
+    pdf.multi_cell(0, 5, pdf_san(f"Correspondente a: {valor_por_extenso(valor)}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
     d = datetime.strptime(data_iso, "%Y-%m-%d")
@@ -2224,7 +2416,7 @@ def gerar_pdf_nota_modelo(num: int, emitente: str, cnpj_emi: str, tomador: str,
         "AVISO: documento gerado por modelo interno — SEM VALOR FISCAL. "
         "A NFS-e oficial (com validade junto à Receita Federal) deve ser emitida no "
         "portal de notas da Prefeitura do seu município, usando os dados acima."
-    ))
+    ), new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(30)
     assinatura(pdf)
     return bytes(pdf.output())
