@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-VetClinic — Sistema de gestão para clínica veterinária
+CARDIOEVET — Sistema de gestão para clínica veterinária
 Módulos: Início, Agenda, Vacinas, Tutores, Pets, Histórico, Exames, Financeiro e Relatórios
 Banco de dados: SQLite local (padrão) ou ☁️ Turso — configure na página "Nuvem".
 Execute com:  streamlit run app.py
@@ -1271,7 +1271,7 @@ def pagina_agenda():
 
         def _msg_conf(r):
             return (
-                f"Olá {r['tutor']}! 🐾 Aqui é da VetClinic. Passando para confirmar: {r['tipo']} "
+                f"Olá {r['tutor']}! 🐾 Aqui é da CARDIOEVET. Passando para confirmar: {r['tipo']} "
                 f"do(a) {r['pet']} no dia {fmt_data(r['data'])} às {r['hora']}. "
                 "Qualquer imprevisto, é só avisar por aqui!"
             )
@@ -1403,14 +1403,14 @@ def pagina_vacinas():
         def _msg_vac(r):
             sit = situacao_vacina(r["proxima_dose"])[0]
             return (
-                f"Olá {r['tutor']}! 🐾 Aqui é da VetClinic. Passando para lembrar da vacina "
+                f"Olá {r['tutor']}! 🐾 Aqui é da CARDIOEVET. Passando para lembrar da vacina "
                 f"{r['vacina']} do(a) {r['pet']} — situação: {sit.lower()} (data de referência: "
                 f"{fmt_data(r['proxima_dose'])}). Podemos agendar a aplicação?"
             )
 
         al["WhatsApp"] = al.apply(lambda r: link_whatsapp(r["telefone"], _msg_vac(r)), axis=1)
         al["E-mail"] = al.apply(
-            lambda r: link_email(r["email"], f"Lembrete de vacina - {r['pet']} | VetClinic", _msg_vac(r)),
+            lambda r: link_email(r["email"], f"Lembrete de vacina - {r['pet']} | CARDIOEVET", _msg_vac(r)),
             axis=1,
         )
         st.dataframe(
@@ -1744,7 +1744,7 @@ def novo_pdf(titulo: str, subtitulo: str = "") -> FPDF:
         pdf.set_y(42)
     pdf.set_font("helvetica", "B", 17)
     pdf.set_text_color(22, 101, 96)
-    pdf.cell(0, 10, "VetClinic - Clínica Veterinária", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, "CARDIOEVET - Clínica Veterinária", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("helvetica", "B", 13)
     pdf.set_text_color(30)
     pdf.cell(0, 8, pdf_san(titulo), align="C", new_x="LMARGIN", new_y="NEXT")
@@ -2061,7 +2061,7 @@ def _extrair_info_cert(pfx_dados: bytes, senha: str):
 def carimbo_texto() -> str:
     nome = (get_config("carimbo_nome", "") or "").strip()
     crmv = (get_config("carimbo_crmv", "") or "").strip()
-    titular = (get_config("cert_titular", "") or "").strip() or "VetClinic"
+    titular = (get_config("cert_titular", "") or "").strip() or "CARDIOEVET"
     linha1 = "  |  ".join(p for p in (nome, crmv) if p) or "Veterinário(a) responsável"
     texto = f"{linha1}\nAssinado digitalmente por {titular} — ICP-Brasil"
     return texto.encode("latin-1", "replace").decode("latin-1")
@@ -2577,7 +2577,7 @@ def tela_login():
     if os.path.exists("assets/logo_login.png"):
         with col_img:
             st.image("assets/logo_login.png", use_container_width=True)
-    st.title("🐾 VetClinic")
+    st.title("❤️ CARDIOEVET")
     st.subheader("Gestão de clínica veterinária")
     st.divider()
     col, _ = st.columns([1, 2])
@@ -3015,7 +3015,7 @@ def carregar_exemplos():
 
 def main():
     st.set_page_config(
-        page_title="VetClinic — Gestão Veterinária",
+        page_title="CARDIOEVET — Gestão Veterinária",
         page_icon="assets/favicon.png" if os.path.exists("assets/favicon.png") else "🐾",
         layout="wide",
     )
@@ -3031,7 +3031,7 @@ def main():
         _c1, _c2, _c3 = st.sidebar.columns([1, 2, 1])
         with _c2:
             st.image("assets/logo.png", use_container_width=True)
-    st.sidebar.title("🐾 VetClinic")
+    st.sidebar.title("❤️ CARDIOEVET")
     st.sidebar.caption(f"👤 {eu['nome']} ({PAPEIS.get(eu['papel'], eu['papel'])})  ·  "
                        f"{'☁️ Nuvem' if nuvem_ativa() else '💾 Local'}")
     if st.sidebar.button("🚪 Sair", use_container_width=True):
