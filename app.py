@@ -877,7 +877,6 @@ def pagina_pets():
             run("DELETE FROM pets WHERE id = ?", (pid,))
             st.success(f"Pet **{row['nome']}** excluído.")
             st.rerun()
-        return
 
     # ----------------------------------------------------------------- #
     #  📜 Emitir receita (simples ou controlada)
