@@ -1616,6 +1616,78 @@ def trunc(s, n: int) -> str:
     return s if len(s) <= n else s[: n - 3] + "..."
 
 
+# --------------------------------------------------------------------------- #
+#  Valor por extenso (usado em recibos)
+# --------------------------------------------------------------------------- #
+
+_UNID = ["", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove"]
+_11_19 = ["", "onze", "doze", "treze", "quatorze", "quinze", "dezesseis",
+          "dezessete", "dezoito", "dezenove"]
+_DEZ = ["", "dez", "vinte", "trinta", "quarenta", "cinquenta", "sessenta",
+        "setenta", "oitenta", "noventa"]
+_CENT = ["", "cento", "duzentos", "trezentos", "quatrocentos", "quinhentos",
+         "seiscentos", "setecentos", "oitocentos", "novecentos"]
+
+
+def _ext_ate_99(n: int) -> str:
+    if n < 10:
+        return _UNID[n]
+    if n == 10:
+        return "dez"
+    if n < 20:
+        return _11_19[n - 10]
+    d, u = divmod(n, 10)
+    return _DEZ[d] if u == 0 else f"{_DEZ[d]} e {_UNID[u]}"
+
+
+def _ext_ate_999(n: int) -> str:
+    if n < 100:
+        return _ext_ate_99(n)
+    if n == 100:
+        return "cem"
+    c, r = divmod(n, 100)
+    return _CENT[c] if r == 0 else f"{_CENT[c]} e {_ext_ate_99(r)}"
+
+
+def valor_por_extenso(valor: float) -> str:
+    """Converte R$ para texto por extenso em pt-BR (até < 1 bilhão)."""
+    valor = abs(float(valor))
+    centavos = int(round((valor - int(valor)) * 100))
+    if centavos == 100:
+        valor += 1
+        centavos = 0
+    reais = int(valor)
+
+    partes = []
+    milhoes, resto = divmod(reais, 1_000_000)
+    milhares, unidades = divmod(resto, 1000)
+    if milhoes:
+        partes.append(f"{_ext_ate_999(milhoes)} {'milhão' if milhoes == 1 else 'milhões'}")
+    if milhares:
+        if milhares == 1:
+            partes.append("mil")
+        else:
+            partes.append(f"{_ext_ate_999(milhares)} mil")
+    if unidades:
+        partes.append(_ext_ate_999(unidades))
+
+    if not reais and not centavos:
+        return "Zero reais"
+    txt = ""
+    if reais:
+        txt = " e ".join(partes) + (" real" if reais == 1 else " reais")
+    if centavos:
+        ext_c = _ext_ate_99(centavos) + (" centavo" if centavos == 1 else " centavos")
+        txt = ext_c if not txt else f"{txt} e {ext_c}"
+    return txt[0].upper() + txt[1:]
+
+
+def proximo_numero(chave: str) -> int:
+    n = int(get_config(chave, "0") or 0) + 1
+    set_config(chave, str(n))
+    return n
+
+
 def assinatura(pdf: FPDF):
     pdf.ln(14)
     pdf.set_font("helvetica", "", 10)
@@ -2054,6 +2126,251 @@ def pagina_relatorios():
         dados = finalizar_pdf(gerar_pdf_agenda(dia.isoformat()))
         st.download_button("⬇️ Baixar agenda em PDF", dados,
                            f"agenda_{dia.isoformat()}.pdf", "application/pdf", type="primary")
+
+
+# --------------------------------------------------------------------------- #
+#  Página: Recibos e Nota Fiscal (modelo)
+# --------------------------------------------------------------------------- #
+
+FORMAS_PAGAMENTO = ["Dinheiro", "PIX", "Cartão de débito", "Cartão de crédito",
+                    "Transferência bancária", "Boleto", "Outro"]
+
+
+def gerar_pdf_recibo(num: int, recebido_de: str, valor: float, servico: str,
+                     forma: str, data_iso: str, obs: str, cidade: str) -> bytes:
+    """Recibo profissional com valor por extenso, caixa de valor e assinatura."""
+    ano = datetime.strptime(data_iso, "%Y-%m-%d").year
+    pdf = novo_pdf("RECIBO", subtitulo=f"Nº {num:04d}/{ano}")
+    pdf.set_font("helvetica", "", 11)
+
+    pdf_campo(pdf, "Recebido de:", recebido_de or "—")
+    pdf_campo(pdf, "Referente a:", servico or "—")
+    pdf_campo(pdf, "Forma pagto.:", forma or "—")
+    pdf_campo(pdf, "Data:", fmt_data(data_iso))
+    if obs.strip():
+        pdf_campo(pdf, "Observações:", obs.strip())
+    pdf.ln(6)
+
+    # caixa de destaque do valor
+    y = pdf.get_y()
+    pdf.set_draw_color(22, 101, 96)
+    pdf.set_fill_color(233, 245, 243)
+    pdf.set_line_width(0.6)
+    pdf.rect(45, y, 120, 16, style="DF")
+    pdf.set_xy(45, y + 3.5)
+    pdf.set_font("helvetica", "B", 14)
+    pdf.set_text_color(22, 101, 96)
+    pdf.cell(120, 9, pdf_san(fmt_moeda(valor)), align="C")
+    pdf.set_y(y + 20)
+    pdf.set_text_color(60)
+    pdf.set_font("helvetica", "I", 9.5)
+    pdf.multi_cell(0, 5, pdf_san(f"Correspondente a: {valor_por_extenso(valor)}"))
+    pdf.ln(4)
+
+    d = datetime.strptime(data_iso, "%Y-%m-%d")
+    meses = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho",
+             "agosto", "setembro", "outubro", "novembro", "dezembro"]
+    pdf.set_font("helvetica", "", 10)
+    pdf.set_text_color(30)
+    pdf.cell(0, 6, pdf_san(f"{(cidade or 'Penha/SC')}, {d.day} de {meses[d.month - 1]} de {d.year}."),
+             new_x="LMARGIN", new_y="NEXT")
+    assinatura(pdf)
+    return bytes(pdf.output())
+
+
+def gerar_pdf_nota_modelo(num: int, emitente: str, cnpj_emi: str, tomador: str,
+                          doc_tom: str, servicos, data_iso: str, obs: str) -> bytes:
+    """Nota de serviço 'modelo' (SEM valor fiscal) com dados prontos p/ prefeitura."""
+    ano = datetime.strptime(data_iso, "%Y-%m-%d").year
+    pdf = novo_pdf("NOTA FISCAL DE SERVIÇO — MODELO", subtitulo=f"Nº {num:04d}/{ano} · Série A")
+
+    pdf.set_font("helvetica", "B", 10)
+    pdf.set_text_color(22, 101, 96)
+    pdf.cell(0, 6, "EMITENTE", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(30)
+    pdf_campo(pdf, "Nome/Razão:", emitente or "—")
+    pdf_campo(pdf, "CNPJ:", cnpj_emi or "—")
+    pdf.ln(3)
+
+    pdf.set_font("helvetica", "B", 10)
+    pdf.set_text_color(22, 101, 96)
+    pdf.cell(0, 6, "TOMADOR DO SERVIÇO", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(30)
+    pdf_campo(pdf, "Nome:", tomador or "—")
+    if doc_tom.strip():
+        pdf_campo(pdf, "CPF/CNPJ:", doc_tom.strip())
+    pdf.ln(3)
+
+    pdf.set_font("helvetica", "B", 10)
+    pdf.set_text_color(22, 101, 96)
+    pdf.cell(0, 6, "DISCRIMINAÇÃO DOS SERVIÇOS", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(30)
+    linhas = [[trunc(d, 60), f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")]
+              for d, v in servicos]
+    pdf_tabela(pdf, ["Descrição dos serviços", "Valor (R$)"], linhas, [150, 30], ["L", "R"])
+    total = sum(v for _, v in servicos)
+    pdf.set_font("helvetica", "B", 10)
+    pdf.cell(150, 7, pdf_san("TOTAL"), border=1)
+    pdf.cell(30, 7, pdf_san(fmt_moeda(total).replace("R$ ", "")), border=1, align="R")
+    pdf.ln(8)
+    pdf_campo(pdf, "Data emissão:", fmt_data(data_iso))
+    if obs.strip():
+        pdf_campo(pdf, "Observações:", obs.strip())
+    pdf.ln(2)
+
+    pdf.set_font("helvetica", "I", 8)
+    pdf.set_text_color(150, 40, 40)
+    pdf.multi_cell(0, 5, pdf_san(
+        "AVISO: documento gerado por modelo interno — SEM VALOR FISCAL. "
+        "A NFS-e oficial (com validade junto à Receita Federal) deve ser emitida no "
+        "portal de notas da Prefeitura do seu município, usando os dados acima."
+    ))
+    pdf.set_text_color(30)
+    assinatura(pdf)
+    return bytes(pdf.output())
+
+
+def pagina_recibos():
+    st.header("🧾 Recibos e Nota de Serviço")
+    relatorios_gate_assinatura()
+    aba = st.radio("Documento", ["🧾 Recibo de pagamento", "📄 Nota de serviço (modelo)"],
+                   horizontal=True)
+    st.divider()
+
+    if aba == "🧾 Recibo de pagamento":
+        origem = st.radio("Gerar recibo a partir de:", ["💰 Lançamento do financeiro", "✏️ Formulário livre"],
+                          horizontal=True)
+
+        nome = servico = forma = ""
+        valor = 0.0
+        if origem == "💰 Lançamento do financeiro":
+            recs = qdf(
+                """SELECT l.*, p.nome AS pet, t.nome AS tutor FROM lancamentos l
+                   LEFT JOIN pets p ON p.id = l.pet_id
+                   LEFT JOIN tutores t ON t.id = p.tutor_id
+                   WHERE l.tipo = 'Receita' ORDER BY l.id DESC LIMIT 100"""
+            )
+            if recs.empty:
+                st.info("Nenhuma receita no financeiro ainda. Use o formulário livre ou lance uma receita em 💰 Financeiro.")
+                return
+            op = {
+                f"#{int(r['id'])} · {fmt_data(r['data'])} · {fmt_moeda(r['valor'])} · "
+                f"{trunc(r['descricao'], 30)} · {r['pet'] or '-'} ({r['tutor'] or 'sem tutor'})": int(r["id"])
+                for _, r in recs.iterrows()
+            }
+            sel = st.selectbox("Selecione a receita", list(op.keys()))
+            lid = op[sel]
+            r = recs[recs["id"] == lid].iloc[0]
+            nome = r["tutor"] or ""
+            servico = r["descricao"] or "Serviços veterinários"
+            if r.get("pet"):
+                servico = f"{servico} — Pet: {r['pet']}"
+            valor = float(r["valor"])
+            forma = r["forma_pagamento"] if r["forma_pagamento"] in FORMAS_PAGAMENTO else "PIX"
+            sufixo = str(lid)
+        else:
+            sufixo = "livre"
+
+        def_i = FORMAS_PAGAMENTO.index(forma) if forma in FORMAS_PAGAMENTO else 1
+        with st.form(f"form_recibo_{sufixo}"):
+            c1, c2 = st.columns(2)
+            f_nome = c1.text_input("Recebido de (tutor/cliente) *", value=nome)
+            f_valor = c2.number_input("Valor (R$) *", min_value=0.0, value=valor,
+                                      step=10.0, format="%.2f")
+            f_serv = st.text_input("Referente a (serviço/pet) *", value=servico)
+            c3, c4 = st.columns(2)
+            f_forma = c3.selectbox("Forma de pagamento", FORMAS_PAGAMENTO, index=def_i)
+            f_data = c4.date_input("Data", value=date.today(), format="DD/MM/YYYY")
+            f_obs = st.text_input("Observações (opcional)")
+            f_cid = st.text_input("Local (cidade/UF)", value=get_config("rec_cidade", "Penha/SC") or "Penha/SC")
+            gerar = st.form_submit_button("🧾 Gerar recibo", type="primary")
+
+        if gerar:
+            if not f_nome.strip() or f_valor <= 0 or not f_serv.strip():
+                st.error("Preencha: recebido de, valor (maior que zero) e referente a.")
+            else:
+                num = proximo_numero("recibo_seq")
+                set_config("rec_cidade", f_cid.strip() or "Penha/SC")
+                pdf_bytes = finalizar_pdf(gerar_pdf_recibo(
+                    num, f_nome.strip(), f_valor, f_serv.strip(), f_forma,
+                    f_data.isoformat(), f_obs, f_cid.strip()))
+                st.session_state["recibo_pdf"] = pdf_bytes
+                st.session_state["recibo_nome"] = f"recibo_{num:04d}_{f_nome.strip().lower().replace(' ', '_')[:20]}.pdf"
+        if st.session_state.get("recibo_pdf"):
+            st.download_button("⬇️ Baixar recibo em PDF", st.session_state["recibo_pdf"],
+                               st.session_state["recibo_nome"], "application/pdf", type="primary")
+
+    else:  # Nota modelo
+        st.caption("📌 Documento **visual** para referência interna — a NFS-e oficial (valor fiscal) "
+                   "você emite no portal da prefeitura **copiando os dados** que o app monta aqui.")
+
+        c1, c2 = st.columns(2)
+        emi = c1.text_input("Emitente (sua clínica)",
+                            value=get_config("cert_titular", "") or "")
+        cnpj = c2.text_input("CNPJ do emitente",
+                             value=get_config("cert_cnpj", "") or "")
+
+        tuts = qdf("SELECT nome, cpf FROM tutores ORDER BY nome")
+        lista_t = ["(digitar outro)"] + tuts["nome"].tolist()
+        tom_sel = st.selectbox("Tomador (seu cliente)", lista_t)
+        if tom_sel == "(digitar outro)":
+            c3, c4 = st.columns(2)
+            tom = c3.text_input("Nome do tomador")
+            doc_t = c4.text_input("CPF/CNPJ do tomador (opcional)")
+        else:
+            tom = tom_sel
+            doc_t = (tuts[tuts["nome"] == tom_sel].iloc[0]["cpf"] or "") if not tuts.empty else ""
+            st.caption(f"Doc. do tomador: {doc_t or 'não informado'}")
+
+        st.markdown("**Serviços** (descrição + valor)")
+        svcs = []
+        for i in range(4):
+            c5, c6 = st.columns([5, 2])
+            d = c5.text_input(f"Serviço {i + 1}", key=f"nf_d{i}",
+                              placeholder="Ex.: Consulta clínica — Pet Juma" if i == 0 else "", label_visibility="visible")
+            v = c6.number_input(f"Valor R$ {i + 1}", min_value=0.0, step=10.0, format="%.2f", key=f"nf_v{i}")
+            if d.strip() and v > 0:
+                svcs.append((d.strip(), v))
+        total = sum(v for _, v in svcs)
+        st.metric("Total da nota", fmt_moeda(total))
+
+        c7, c8 = st.columns(2)
+        nf_data = c7.date_input("Data de emissão", value=date.today(), format="DD/MM/YYYY")
+        nf_obs = c8.text_input("Observações (opcional)")
+
+        if st.button("📄 Gerar nota (modelo) + dados p/ prefeitura", type="primary"):
+            if not emi.strip() or not tom.strip() or not svcs:
+                st.error("Preencha emitente, tomador e pelo menos 1 serviço com valor.")
+            else:
+                num = proximo_numero("nf_seq")
+                pdf_bytes = finalizar_pdf(gerar_pdf_nota_modelo(
+                    num, emi.strip(), cnpj.strip(), tom.strip(), doc_t.strip(),
+                    svcs, nf_data.isoformat(), nf_obs))
+                st.session_state["nf_pdf"] = pdf_bytes
+                st.session_state["nf_num"] = num
+                resumo = (
+                    f"PREFEITURA DE PENHA — EMISSÃO NFS-e (dados prontos)\n"
+                    f"===============================================\n"
+                    f"Emitente: {emi.strip()}\n"
+                    f"CNPJ: {cnpj.strip() or '-'}\n"
+                    f"Tomador: {tom.strip()}\n"
+                    f"Doc. tomador: {doc_t.strip() or '-'}\n"
+                    f"Data: {fmt_data(nf_data.isoformat())}\n"
+                    f"-----------------------------------------------\n"
+                    + "\n".join(f"• {d} — {fmt_moeda(v)}" for d, v in svcs) +
+                    f"\n-----------------------------------------------\n"
+                    f"TOTAL: {fmt_moeda(total)}\n"
+                    f"Obs.: {nf_obs.strip() or '-'}"
+                )
+                st.session_state["nf_resumo"] = resumo
+
+        if st.session_state.get("nf_pdf"):
+            ano = datetime.strptime(nf_data.isoformat(), "%Y-%m-%d").year
+            st.download_button("⬇️ Baixar nota (modelo) em PDF", st.session_state["nf_pdf"],
+                               f"nota_{st.session_state['nf_num']:04d}_{ano}.pdf", "application/pdf",
+                               type="primary")
+            with st.expander("📋 Copie estes dados no portal da prefeitura", expanded=True):
+                st.code(st.session_state.get("nf_resumo", ""), language=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -2533,7 +2850,7 @@ def main():
     st.sidebar.divider()
 
     opcoes = ["🏠 Início", "📅 Agenda", "💉 Vacinas", "👤 Tutores", "🐾 Pets",
-              "📋 Histórico", "📎 Exames", "💰 Financeiro", "📄 Relatórios"]
+              "📋 Histórico", "📎 Exames", "💰 Financeiro", "🧾 Recibos/NF", "📄 Relatórios"]
     if eu["papel"] == "admin":
         opcoes += ["🔐 Usuários", "🔏 Assinatura", "☁️ Nuvem"]
     pagina = st.sidebar.radio("Menu", opcoes)
@@ -2567,6 +2884,8 @@ def main():
         pagina_exames()
     elif pagina == "💰 Financeiro":
         pagina_financeiro()
+    elif pagina == "🧾 Recibos/NF":
+        pagina_recibos()
     elif pagina == "🔐 Usuários":
         pagina_usuarios()
     elif pagina == "🔏 Assinatura":
