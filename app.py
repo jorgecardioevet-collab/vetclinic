@@ -6,6 +6,7 @@ Banco de dados: SQLite local (padrão) ou ☁️ Turso — configure na página 
 Execute com:  streamlit run app.py
 """
 
+import base64
 import hashlib
 import io
 import json
@@ -1122,6 +1123,8 @@ def pagina_receita_pet(df, tutores):
                 st.session_state["rec_pdf"],
                 f"receita_{st.session_state['rec_num']:04d}_{st.session_state['rec_pet'].lower().replace(' ', '_')}.pdf",
                 "application/pdf", type="primary")
+            botao_imprimir_pdf(st.session_state["rec_pdf"],
+                               f"receita_{st.session_state['rec_num']:04d}")
     return pid
 
 
@@ -1199,6 +1202,16 @@ def pagina_historico():
     )
     botao_csv(df_show[["data", "tipo", "veterinario", "peso_kg", "descricao"]],
               f"historico_{row['nome'].replace(' ', '_')}.csv", "⬇️ Baixar histórico em CSV")
+
+    # ---- Histórico em PDF (para imprimir/baixar) ---------------------------- #
+    if st.button("📄 Gerar histórico em PDF", key=f"gen_hist_{pid}"):
+        with st.spinner("Gerando PDF do histórico…"):
+            st.session_state[f"_histpdf_{pid}"] = finalizar_pdf(gerar_pdf_historico(pid))
+    if st.session_state.get(f"_histpdf_{pid}"):
+        st.download_button("⬇️ Baixar histórico em PDF", st.session_state[f"_histpdf_{pid}"],
+                           f"historico_{row['nome'].lower().replace(' ', '_')}.pdf",
+                           "application/pdf", type="primary", key=f"dl_hist_{pid}")
+        botao_imprimir_pdf(st.session_state[f"_histpdf_{pid}"], f"histpet_{pid}")
 
     # ---- Editar / excluir registro ------------------------------------------ #
     with st.expander("✏️ Editar ou excluir um registro"):
@@ -1946,6 +1959,30 @@ def pdf_vazio(pdf: FPDF, texto: str):
     pdf.cell(0, 8, pdf_san(texto), new_x="LMARGIN", new_y="NEXT")
 
 
+def botao_imprimir_pdf(pdf_bytes: bytes, chave: str, altura: int = 620):
+    """Botão '🖨️ Visualizar / imprimir': mostra o PDF na tela no visualizador do
+    próprio navegador — basta clicar no ícone de impressora (ou Ctrl+P).
+
+    `chave` deve ser única por documento/tela.
+    """
+    k_view = f"_view_{chave}"
+    if st.button("🖨️ Visualizar / imprimir", key=f"btn_view_{chave}"):
+        st.session_state[k_view] = not st.session_state.get(k_view, False)
+    if st.session_state.get(k_view):
+        b64 = base64.b64encode(pdf_bytes).decode()
+        st.markdown(
+            f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="{altura}" '
+            f'style="border:1px solid #cfd8d3; border-radius:8px; background:#f8faf9;"></iframe>',
+            unsafe_allow_html=True,
+        )
+        st.caption("🖨️ **Para imprimir:** clique no **ícone de impressora** no canto superior "
+                   "direito do visualizador acima — ou pressione **Ctrl+P** (Windows) / "
+                   "**Cmd+P** (Mac). O documento sai idêntico ao PDF.")
+        if st.button("✖ Fechar visualização", key=f"btn_close_{chave}"):
+            st.session_state[k_view] = False
+            st.rerun()
+
+
 def trunc(s, n: int) -> str:
     s = str(s if s is not None else "").strip()
     return s if len(s) <= n else s[: n - 3] + "..."
@@ -2444,12 +2481,14 @@ def pagina_relatorios():
             dados = finalizar_pdf(gerar_pdf_carteirinha(pid))
             st.download_button("⬇️ Baixar carteirinha em PDF", dados,
                                f"carteirinha_{nome}.pdf", "application/pdf", type="primary")
+            botao_imprimir_pdf(dados, f"carteirinha_{pid}")
         else:
             n = qdf("SELECT COUNT(*) c FROM historico WHERE pet_id = ?", (pid,)).iloc[0]["c"]
             st.caption(f"{n} atendimento(s) registrado(s) para este pet.")
             dados = finalizar_pdf(gerar_pdf_historico(pid))
             st.download_button("⬇️ Baixar histórico em PDF", dados,
                                f"historico_{nome}.pdf", "application/pdf", type="primary")
+            botao_imprimir_pdf(dados, f"histrel_{pid}")
 
     elif tipo == "Financeiro do mês":
         meses_db = qdf("SELECT DISTINCT substr(data, 1, 7) AS m FROM lancamentos")["m"].tolist()
@@ -2461,12 +2500,14 @@ def pagina_relatorios():
         dados = finalizar_pdf(gerar_pdf_financeiro(mes))
         st.download_button("⬇️ Baixar relatório financeiro", dados,
                            f"financeiro_{mes}.pdf", "application/pdf", type="primary")
+        botao_imprimir_pdf(dados, f"fin_{mes}")
 
     else:  # Agenda do dia
         dia = st.date_input("Dia", value=date.today(), format="DD/MM/YYYY")
         dados = finalizar_pdf(gerar_pdf_agenda(dia.isoformat()))
         st.download_button("⬇️ Baixar agenda em PDF", dados,
                            f"agenda_{dia.isoformat()}.pdf", "application/pdf", type="primary")
+        botao_imprimir_pdf(dados, f"agenda_{dia.isoformat()}")
 
 
 # --------------------------------------------------------------------------- #
@@ -2640,6 +2681,7 @@ def pagina_recibos():
         if st.session_state.get("recibo_pdf"):
             st.download_button("⬇️ Baixar recibo em PDF", st.session_state["recibo_pdf"],
                                st.session_state["recibo_nome"], "application/pdf", type="primary")
+            botao_imprimir_pdf(st.session_state["recibo_pdf"], "recibo_atual")
 
     else:  # Nota modelo
         st.caption("📌 Documento **visual** para referência interna — a NFS-e oficial (valor fiscal) "
@@ -2710,6 +2752,8 @@ def pagina_recibos():
             st.download_button("⬇️ Baixar nota (modelo) em PDF", st.session_state["nf_pdf"],
                                f"nota_{st.session_state['nf_num']:04d}_{ano}.pdf", "application/pdf",
                                type="primary")
+            botao_imprimir_pdf(st.session_state["nf_pdf"],
+                               f"nota_{st.session_state['nf_num']:04d}")
             with st.expander("📋 Copie estes dados no portal da prefeitura", expanded=True):
                 st.code(st.session_state.get("nf_resumo", ""), language=None)
 
@@ -2979,8 +3023,11 @@ def pagina_exames():
                        reg["mime"] or "application/octet-stream", type="primary")
     if str(reg["mime"]).startswith("image"):
         st.image(dados, caption=reg["nome"], width=440)
+    elif reg["mime"] == "application/pdf":
+        botao_imprimir_pdf(dados, f"anexo_{aid}", altura=700)
     else:
-        st.caption("A pré-visualização está disponível apenas para imagens. Use o botão de download para abrir o PDF.")
+        st.caption("A pré-visualização está disponível apenas para imagens e PDFs. "
+                   "Use o botão de download para abrir o arquivo.")
 
     st.markdown("**🗑️ Excluir anexo**")
     confirma = st.checkbox("Confirmo que desejo excluir este arquivo", key=f"conf_anx_{aid}")
@@ -3312,6 +3359,7 @@ def _render_laudo_pdf_widgets(pdf_bytes: bytes, numero: int, pet_nome: str, key_
         pdf_bytes,
         f"laudo_{numero:04d}_{pet_nome.lower().replace(' ', '_')}.pdf",
         "application/pdf", type="primary", key=f"dl_laudo_{key_sufixo}")
+    botao_imprimir_pdf(pdf_bytes, f"laudo_{key_sufixo}")
 
 
 def pagina_laudos():
