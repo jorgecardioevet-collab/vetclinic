@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import sqlite3
 import urllib.parse
@@ -216,6 +217,18 @@ CREATE TABLE IF NOT EXISTS laudo_imagens (
     legenda   TEXT DEFAULT '',
     dados     BLOB,
     criado_em TEXT DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS atestados (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    pet_id       INTEGER NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+    numero       INTEGER DEFAULT 0,
+    modelo       TEXT NOT NULL,
+    titulo       TEXT NOT NULL,
+    data_emissao TEXT NOT NULL,           -- AAAA-MM-DD
+    cidade       TEXT DEFAULT '',
+    texto        TEXT NOT NULL DEFAULT '', -- texto final (editado) do atestado
+    criado_em    TEXT DEFAULT (datetime('now', 'localtime'))
 );
 """
 
@@ -488,18 +501,34 @@ def link_email(email: str, assunto: str, corpo: str) -> str:
 #  Página: Início
 # --------------------------------------------------------------------------- #
 
-def pagina_inicio():
-    st.header("🏠 Visão geral")
+def hoje_extenso(d: date | None = None) -> str:
+    d = d or date.today()
+    dias = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
+            "sexta-feira", "sábado", "domingo"]
+    meses = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho",
+             "agosto", "setembro", "outubro", "novembro", "dezembro"]
+    return f"{dias[d.weekday()].capitalize()}, {d.day} de {meses[d.month - 1]} de {d.year}"
 
+
+def _ir_para(destino: str):
+    """Agenda a navegação para a aba `destino` no próximo rerun (aplicada no main())."""
+    st.session_state["_nav_pendente"] = destino
+
+
+def pagina_inicio():
     hoje = date.today()
     mes_atual = hoje.strftime("%Y-%m")
+    mes_ant = (hoje.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
 
     n_tutores = qdf("SELECT COUNT(*) c FROM tutores").iloc[0]["c"]
     n_pets = qdf("SELECT COUNT(*) c FROM pets").iloc[0]["c"]
-    n_hist = qdf("SELECT COUNT(*) c FROM historico").iloc[0]["c"]
     n_mes = qdf(
         "SELECT COUNT(*) c FROM historico WHERE strftime('%Y-%m', data) = ?",
         (mes_atual,),
+    ).iloc[0]["c"]
+    n_mes_ant = qdf(
+        "SELECT COUNT(*) c FROM historico WHERE strftime('%Y-%m', data) = ?",
+        (mes_ant,),
     ).iloc[0]["c"]
     n_agenda_hoje = qdf(
         "SELECT COUNT(*) c FROM agendamentos WHERE data = ? AND status != 'Cancelado'",
@@ -523,18 +552,78 @@ def pagina_inicio():
         "SELECT COALESCE(SUM(valor),0) s FROM lancamentos WHERE tipo='Despesa' AND substr(data,1,7)=?",
         (mes_atual,),
     ).iloc[0]["s"])
+    receitas_ant = float(qdf(
+        "SELECT COALESCE(SUM(valor),0) s FROM lancamentos WHERE tipo='Receita' AND substr(data,1,7)=?",
+        (mes_ant,),
+    ).iloc[0]["s"])
+    despesas_ant = float(qdf(
+        "SELECT COALESCE(SUM(valor),0) s FROM lancamentos WHERE tipo='Despesa' AND substr(data,1,7)=?",
+        (mes_ant,),
+    ).iloc[0]["s"])
+    prox = qdf(
+        """SELECT a.hora, p.nome AS pet FROM agendamentos a
+           JOIN pets p ON p.id = a.pet_id
+           WHERE a.data = ? AND a.status != 'Cancelado' AND a.hora >= ?
+           ORDER BY a.hora LIMIT 1""",
+        (hoje.isoformat(), datetime.now().strftime("%H:%M")),
+    )
 
+    # ---- Faixa de boas-vindas (hero) ---------------------------------------- #
+    eu = st.session_state.usuario
+    _partes = (eu.get("nome") or "").split()
+    if len(_partes) > 1 and _partes[0].rstrip(".").lower() in ("dr", "dra", "sr", "sra", "srª"):
+        primeiro_nome = f"{_partes[0]} {_partes[1]}"
+    else:
+        primeiro_nome = _partes[0] if _partes else ""
+    chips = [
+        f"🐾 {n_pets} pet(s)", f"👤 {n_tutores} tutor(es)",
+        "☁️ Banco em nuvem" if nuvem_ativa() else "💾 Banco local",
+        (f"⏰ Próximo: {prox.iloc[0]['hora']} — {prox.iloc[0]['pet']}"
+         if not prox.empty else "⏰ Sem compromissos pendentes hoje"),
+    ]
+    chips_html = "".join(f'<span class="cv-chip">{c}</span>' for c in chips)
+    st.markdown(
+        f'<div class="cv-hero"><h1>❤️ CARDIOEVET</h1>'
+        f'<div class="cv-sub">{hoje_extenso(hoje)} &nbsp;·&nbsp; 👋 Olá, {primeiro_nome}! '
+        f"Aqui está o resumo da sua clínica.</div>"
+        f'<div class="cv-chips">{chips_html}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ---- Indicadores principais --------------------------------------------- #
+    saldo_mes = receitas - despesas
+    saldo_ant = receitas_ant - despesas_ant
+    dif_saldo = saldo_mes - saldo_ant
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("👤 Tutores", n_tutores)
-    c2.metric("🐾 Pets", n_pets)
-    c3.metric("📅 Compromissos hoje", n_agenda_hoje)
-    c4.metric("💰 Saldo do mês", fmt_moeda(receitas - despesas))
+    c1.metric("📅 Compromissos hoje", n_agenda_hoje,
+              delta=f"agora: {'—' if prox.empty else prox.iloc[0]['hora']}", delta_color="off")
+    c2.metric("📋 Atendimentos no mês", n_mes,
+              delta=n_mes - n_mes_ant, delta_color="normal")
+    c3.metric("💰 Saldo do mês", fmt_moeda(saldo_mes),
+              delta=f"{'+' if dif_saldo >= 0 else '−'}{fmt_moeda(abs(dif_saldo))} vs. mês anterior",
+              delta_color="normal" if dif_saldo >= 0 else "inverse")
+    n_alerta = int(n_vencidas) + int(n_a_vencer)
+    c4.metric("💉 Vacinas p/ atenção", n_alerta,
+              delta=f"{n_vencidas} vencida(s)" if int(n_vencidas) else "carteiras em dia",
+              delta_color="inverse" if int(n_vencidas) else "off")
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("📋 Atendimentos", n_hist)
-    c6.metric("🗓️ Atendimentos no mês", n_mes)
-    c7.metric("🔴 Vacinas vencidas", n_vencidas)
-    c8.metric("🟡 Reforços em 15 dias", n_a_vencer)
+    # ---- Ações rápidas ------------------------------------------------------- #
+    with st.container(border=True):
+        st.markdown("**🚀 Ações rápidas**")
+        qa1 = st.columns(3)
+        qa2 = st.columns(3)
+        if qa1[0].button("🐾 Ver pets", key="qa_pets", use_container_width=True):
+            _ir_para("🐾 Pets")
+        if qa1[1].button("📋 Registrar atendimento", key="qa_hist", use_container_width=True):
+            _ir_para("📋 Histórico")
+        if qa1[2].button("📅 Abrir agenda", key="qa_agenda", use_container_width=True):
+            _ir_para("📅 Agenda")
+        if qa2[0].button("🔬 Novo laudo", key="qa_laudos", use_container_width=True):
+            _ir_para("🔬 Laudos")
+        if qa2[1].button("📜 Novo atestado", key="qa_atestado", use_container_width=True):
+            _ir_para("📜 Atestados")
+        if qa2[2].button("💰 Financeiro", key="qa_fin", use_container_width=True):
+            _ir_para("💰 Financeiro")
 
     st.divider()
     col_a, col_b = st.columns(2)
@@ -1305,7 +1394,7 @@ def pagina_agenda():
                 pet_lbl = st.selectbox("Pet *", list(op.keys()))
                 c1, c2, c3 = st.columns(3)
                 data = c1.date_input("Data *", value=hoje, min_value=date(2020, 1, 1), format="DD/MM/YYYY")
-                hora = c2.time_input("Horário *", value=time(9, 0), step=900, format="HH:mm")
+                hora = c2.time_input("Horário *", value=time(9, 0), step=900, format="24h")
                 tipo = c3.selectbox("Tipo", TIPOS_AGENDAMENTO)
                 veterinario = st.text_input("Veterinário(a) responsável")
                 motivo = st.text_input("Motivo / observações")
@@ -1383,7 +1472,7 @@ def pagina_agenda():
                     hora_val = datetime.strptime(str(ap["hora"])[:5], "%H:%M").time()
                 except ValueError:
                     hora_val = time(9, 0)
-                nova_hora = c2.time_input("Horário *", value=hora_val, step=900, format="HH:mm")
+                nova_hora = c2.time_input("Horário *", value=hora_val, step=900, format="24h")
                 novo_status = c3.selectbox(
                     "Status", STATUS_AGENDAMENTO,
                     index=STATUS_AGENDAMENTO.index(ap["status"]) if ap["status"] in STATUS_AGENDAMENTO else 0,
@@ -3585,6 +3674,297 @@ def pagina_laudos():
                 st.divider()
 
 
+# --------------------------------------------------------------------------- #
+#  Atestados (modelos prontos, texto editável, salvos por pet)
+# --------------------------------------------------------------------------- #
+
+# extras: (chave, rótulo, tipo["texto"|"data"], padrão)
+MODELOS_ATESTADO = {
+    "comparecimento": {
+        "rotulo": "🩺 Comparecimento à consulta (justificativa p/ trabalho)",
+        "titulo": "ATESTADO DE COMPARECIMENTO À CONSULTA VETERINÁRIA",
+        "extras": [("horario", "Período do atendimento (ex.: das 09h às 11h)", "texto", "")],
+        "texto": (
+            "Atesto, para os devidos fins, que o(a) Sr(a). {tutor} esteve presente nesta "
+            "clínica veterinária na data da emissão deste documento, no período das {horario}, "
+            "acompanhando o animal {pet} ({especie}, {raca}, {sexo}), de sua propriedade, "
+            "em atendimento médico-veterinário."
+        ),
+    },
+    "ultrassom": {
+        "rotulo": "🔊 Exame de ultrassom",
+        "titulo": "ATESTADO — EXAME DE ULTRASSONOGRAFIA",
+        "extras": [("data_exame", "Data do exame", "data", "")],
+        "texto": (
+            "Atesto, para os devidos fins, que o animal {pet} ({especie}, {raca}, {sexo}), "
+            "de propriedade do(a) Sr(a). {tutor}, foi submetido(a) a exame de ultrassonografia "
+            "nesta clínica veterinária no dia {data_exame}, realizado por médico(a) "
+            "veterinário(a). Os resultados e achados do exame constam no respectivo laudo."
+        ),
+    },
+    "ecocardiograma": {
+        "rotulo": "❤️ Exame ecocardiográfico",
+        "titulo": "ATESTADO — EXAME ECOCARDIOGRÁFICO",
+        "extras": [("data_exame", "Data do exame", "data", "")],
+        "texto": (
+            "Atesto, para os devidos fins, que o animal {pet} ({especie}, {raca}, {sexo}), "
+            "de propriedade do(a) Sr(a). {tutor}, foi submetido(a) a exame ecocardiográfico "
+            "(modo-M, bidimensional e Doppler) nesta clínica veterinária no dia {data_exame}, "
+            "realizado por médico(a) veterinário(a). Os resultados e achados do exame constam "
+            "no respectivo laudo."
+        ),
+    },
+    "cirurgia": {
+        "rotulo": "⚕️ Cirurgia eletiva (realizada)",
+        "titulo": "ATESTADO — PROCEDIMENTO CIRÚRGICO ELETIVO",
+        "extras": [
+            ("procedimento", "Procedimento realizado (ex.: ovariossalpingohisterectomia — castração)", "texto", ""),
+            ("data_proc", "Data do procedimento", "data", ""),
+            ("recuperacao", "Período de recuperação orientado", "texto", "10 a 14 dias"),
+        ],
+        "texto": (
+            "Atesto, para os devidos fins, que o animal {pet} ({especie}, {raca}, {sexo}), "
+            "de propriedade do(a) Sr(a). {tutor}, foi submetido(a) a procedimento cirúrgico "
+            "eletivo — {procedimento} — nesta clínica veterinária no dia {data_proc}, "
+            "transcorrendo sem intercorrências. Foi orientado período de recuperação de "
+            "{recuperacao}, com cuidados pós-operatórios conforme prescrição "
+            "médico-veterinária."
+        ),
+    },
+    "internacao": {
+        "rotulo": "🏥 Internação",
+        "titulo": "ATESTADO DE INTERNAÇÃO",
+        "extras": [
+            ("entrada", "Data de entrada", "data", ""),
+            ("saida", "Data de saída (ou de hoje, se ainda internado)", "data", ""),
+            ("motivo", "Motivo da internação", "texto", ""),
+        ],
+        "texto": (
+            "Atesto, para os devidos fins, que o animal {pet} ({especie}, {raca}, {sexo}), "
+            "de propriedade do(a) Sr(a). {tutor}, esteve internado(a) nesta clínica "
+            "veterinária no período de {entrada} a {saida}, em tratamento de {motivo}, "
+            "recebendo cuidados médico-veterinários contínuos."
+        ),
+    },
+    "eutanasia": {
+        "rotulo": "🕊️ Eutanásia",
+        "titulo": "ATESTADO DE EUTANÁSIA",
+        "extras": [
+            ("data_proc", "Data do procedimento", "data", ""),
+            ("motivo", "Indicação (motivo)", "texto",
+             "enfermidade irreversível e incurável, com comprometimento irreversível da "
+             "qualidade de vida do animal"),
+        ],
+        "texto": (
+            "Atesto, para os devidos fins, que o animal {pet} ({especie}, {raca}, {sexo}), "
+            "de propriedade do(a) Sr(a). {tutor}, foi submetido(a) ao procedimento de "
+            "eutanásia no dia {data_proc}, por indicação médico-veterinária ({motivo}), "
+            "realizado por método humanitário, com prévia anestesia, sob supervisão direta "
+            "de médico(a) veterinário(a), em conformidade com a Resolução CFMV nº 1000/2012 "
+            "(Boas Práticas de Eutanásia em Animais). Coloco-me à disposição para "
+            "esclarecimentos adicionais."
+        ),
+    },
+    "obito": {
+        "rotulo": "🌈 Óbito (morte)",
+        "titulo": "ATESTADO DE ÓBITO",
+        "extras": [
+            ("data_obito", "Data do óbito", "data", ""),
+            ("causa", "Causa (ou \"a esclarecer\")", "texto", "a esclarecer"),
+        ],
+        "texto": (
+            "Atesto, para os devidos fins, que o animal {pet} ({especie}, {raca}, {sexo}), "
+            "de propriedade do(a) Sr(a). {tutor}, veio a óbito no dia {data_obito}. "
+            "Causa: {causa}."
+        ),
+    },
+    "sanitario_viagem": {
+        "rotulo": "✈️ Atestado sanitário para viagem/transporte",
+        "titulo": "ATESTADO SANITÁRIO PARA TRANSPORTE",
+        "extras": [
+            ("origem", "Cidade/UF de origem", "texto", "Penha/SC"),
+            ("destino", "Cidade/UF de destino", "texto", ""),
+            ("via", "Meio de transporte (ex.: rodoviária, aérea)", "texto", "rodoviária"),
+        ],
+        "texto": (
+            "Atesto, para os devidos fins, que o animal {pet} ({especie}, {raca}, {sexo}), "
+            "de propriedade do(a) Sr(a). {tutor}, foi examinado(a) nesta data, "
+            "encontrando-se clínica e aparentemente saudável, apto(a) a realizar viagem por "
+            "via {via}, com origem em {origem} e destino a {destino}. A carteira de "
+            "vacinação do animal encontra-se atualizada, incluindo vacina antirrábica "
+            "aplicada há mais de 30 dias e dentro do prazo de validade. Este atestado tem "
+            "validade de 10 (dez) dias a partir da data de emissão. Recomenda-se confirmar "
+            "as exigências específicas da companhia/transportadora e do local de destino."
+        ),
+    },
+}
+
+
+def _fmt_atestado(tpl: str, ctx: dict) -> str:
+    """Substitui {placeholders} do modelo pelos valores; desconhecidos ficam como estão."""
+    return re.sub(r"\{(\w+)\}", lambda m: str(ctx.get(m.group(1), m.group(0))), tpl)
+
+
+def gerar_pdf_atestado(numero: int, pet, titulo: str, texto: str,
+                       data_iso: str, cidade: str) -> bytes:
+    """Gera o PDF do atestado numerado (carimbo; assinatura ICP via finalizar_pdf)."""
+    ano = datetime.strptime(data_iso, "%Y-%m-%d").year
+    pdf = novo_pdf(pdf_san(titulo), subtitulo=f"Nº {numero:04d}/{ano}")
+    dados_pet(pdf, pet)
+    pdf.set_font("helvetica", "", 10.5)
+    pdf.multi_cell(0, 6, pdf_san(texto.strip()), align="J", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+    d = datetime.strptime(data_iso, "%Y-%m-%d")
+    meses = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho",
+             "agosto", "setembro", "outubro", "novembro", "dezembro"]
+    pdf.set_font("helvetica", "", 10)
+    pdf.cell(0, 6, pdf_san(f"{(cidade or 'Penha/SC')}, {d.day} de {meses[d.month - 1]} de {d.year}."),
+             new_x="LMARGIN", new_y="NEXT")
+    assinatura(pdf)
+    return bytes(pdf.output())
+
+
+def pagina_atestados():
+    st.header("📜 Atestados")
+    st.caption("Modelos prontos de atestados (cirurgia eletiva, internação, eutanásia, exames, "
+               "comparecimento, óbito e sanitário para viagem). **Preencha os campos do modelo — "
+               "o texto se monta sozinho** — e ajuste à vontade na caixa de texto antes de salvar. "
+               "O atestado sai numerado, fica salvo no cadastro do pet e já vai com seu carimbo "
+               "(e assinatura digital ICP-Brasil, se estiver desbloqueada).")
+
+    pets = qdf(
+        """SELECT p.id, p.nome, t.nome AS tutor FROM pets p
+           JOIN tutores t ON t.id = p.tutor_id ORDER BY p.nome"""
+    )
+    if pets.empty:
+        st.info("Cadastre um tutor e um pet primeiro.")
+        return
+
+    op = {f"{r['nome']} — {r['tutor']}": r["id"] for _, r in pets.iterrows()}
+    pid = op[st.selectbox("Pet", list(op.keys()), key="at_pet")]
+    pet = qdf(
+        """SELECT p.*, t.nome AS tutor, t.telefone FROM pets p
+           JOIN tutores t ON t.id = p.tutor_id WHERE p.id = ?""",
+        (pid,),
+    ).iloc[0]
+
+    # Cartão de sucesso sobrevive ao rerun (mesmo padrão dos laudos)
+    if st.session_state.get("at_pdf"):
+        with st.container(border=True):
+            st.success(f"✅ Atestado nº {st.session_state['at_num']:04d} "
+                       f"de **{st.session_state['at_pet']}** pronto!")
+            st.download_button(
+                f"⬇️ Baixar atestado nº {st.session_state['at_num']:04d} (PDF"
+                f"{' assinado' if assinatura_ativa() and st.session_state.get('cert_senha') else ''})",
+                st.session_state["at_pdf"],
+                f"atestado_{st.session_state['at_num']:04d}_"
+                f"{st.session_state['at_pet'].lower().replace(' ', '_')}.pdf",
+                "application/pdf", type="primary", key="dl_atestado_novo")
+            botao_imprimir_pdf(st.session_state["at_pdf"], "atestado_novo")
+
+    # ---- Novo atestado ------------------------------------------------------- #
+    with st.expander("➕ Novo atestado", expanded=True):
+        modelo = st.selectbox(
+            "Modelo de atestado", list(MODELOS_ATESTADO.keys()),
+            format_func=lambda k: MODELOS_ATESTADO[k]["rotulo"], key="at_modelo")
+        mod = MODELOS_ATESTADO[modelo]
+
+        ctx = {
+            "pet": pet["nome"], "tutor": pet["tutor"],
+            "especie": pet["especie"] or "—", "raca": pet["raca"] or "SRD",
+            "sexo": pet["sexo"] or "—",
+            "nasc": fmt_data(pet["nascimento"]) if pet["nascimento"] else "—",
+            "microchip": pet["microchip"] or "—",
+        }
+        if mod["extras"]:
+            st.markdown("**Campos do modelo**")
+        for chave, rotulo, tipo_campo, padrao in mod["extras"]:
+            if tipo_campo == "data":
+                v = st.date_input(rotulo, value=date.today(), min_value=date(1990, 1, 1),
+                                  max_value=date.today(), format="DD/MM/YYYY",
+                                  key=f"at_{modelo}_{chave}")
+                ctx[chave] = fmt_data(v.isoformat())
+            else:
+                ctx[chave] = st.text_input(rotulo, value=padrao,
+                                           key=f"at_{modelo}_{chave}").strip()
+
+        texto_inicial = _fmt_atestado(mod["texto"], ctx)
+        h_ctx = abs(hash("§".join(f"{k}={v}" for k, v in sorted(ctx.items()))))
+        st.caption("💡 Ao alterar qualquer campo acima, o texto volta ao modelo atualizado — "
+                   "faça os ajustes finos no texto **por último**.")
+
+        with st.form(f"form_atestado_{modelo}"):
+            c1, c2 = st.columns(2)
+            data_at = c1.date_input("Data do atestado", value=date.today(),
+                                    max_value=date.today(), format="DD/MM/YYYY")
+            cidade = c2.text_input("Local (cidade/UF)",
+                                   value=get_config("rec_cidade", "Penha/SC") or "Penha/SC")
+            texto = st.text_area("Texto do atestado (edite livremente)",
+                                 value=texto_inicial, height=250,
+                                 key=f"at_texto_{modelo}_{h_ctx}")
+            reg_hist = st.checkbox("Registrar também no histórico do pet", value=True,
+                                   key=f"at_rh_{modelo}")
+            gerar = st.form_submit_button("💾 Salvar atestado e gerar PDF", type="primary")
+
+        if gerar:
+            if not texto.strip():
+                st.error("O texto do atestado não pode ficar vazio.")
+            else:
+                numero = proximo_numero("atestado_seq")
+                set_config("rec_cidade", cidade.strip() or "Penha/SC")
+                run("""INSERT INTO atestados (pet_id, numero, modelo, titulo, data_emissao,
+                                             cidade, texto)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (pid, numero, modelo, mod["titulo"], data_at.isoformat(),
+                     cidade.strip(), texto.strip()))
+                if reg_hist:
+                    vet = (get_config("carimbo_nome", "") or
+                           st.session_state.usuario.get("nome", "")).strip()
+                    run("""INSERT INTO historico (pet_id, data, tipo, veterinario, descricao)
+                           VALUES (?,?,?,?,?)""",
+                        (pid, data_at.isoformat(), "Atestado", vet,
+                         f"Atestado nº {numero:04d}/{data_at.year} — {mod['rotulo']}"))
+                pdf_bytes = finalizar_pdf(gerar_pdf_atestado(
+                    numero, pet, mod["titulo"], texto, data_at.isoformat(), cidade.strip()))
+                st.session_state["at_pdf"] = pdf_bytes
+                st.session_state["at_num"] = numero
+                st.session_state["at_pet"] = pet["nome"]
+                st.rerun()
+
+    # ---- Atestados emitidos para este pet ----------------------------------- #
+    with st.expander("📂 Atestados emitidos deste pet"):
+        ats = qdf(
+            """SELECT id, numero, modelo, titulo, data_emissao, cidade, texto
+               FROM atestados WHERE pet_id = ? ORDER BY id DESC""", (pid,))
+        if ats.empty:
+            st.info("Nenhum atestado emitido para este pet ainda.")
+        else:
+            st.caption(f"{len(ats)} atestado(s). É possível gerar o PDF novamente a qualquer "
+                       "momento (o texto sai exatamente como foi emitido).")
+            for _, at in ats.iterrows():
+                rotulo = (MODELOS_ATESTADO.get(at["modelo"], {}) or {}).get("rotulo", at["modelo"])
+                st.markdown(f"**#{int(at['numero']):04d}/{str(at['data_emissao'])[:4]} — {rotulo}** "
+                            f"· emitido em {fmt_data(at['data_emissao'])}")
+                st.caption(trunc((at["texto"] or "").replace("\n", " "), 180))
+                b1, b2 = st.columns([2, 3])
+                if b1.button("⬇️ Gerar PDF novamente", key=f"at_pdf_{at['id']}",
+                             use_container_width=True):
+                    pdf_bytes = finalizar_pdf(gerar_pdf_atestado(
+                        int(at["numero"]), pet, at["titulo"], at["texto"] or "",
+                        at["data_emissao"], at["cidade"] or "Penha/SC"))
+                    st.session_state["at_pdf"] = pdf_bytes
+                    st.session_state["at_num"] = int(at["numero"])
+                    st.session_state["at_pet"] = pet["nome"]
+                    st.rerun()
+                conf_a = st.checkbox("Confirmo excluir", key=f"at_conf_{at['id']}")
+                if b2.button("🗑️ Excluir atestado", key=f"at_del_{at['id']}",
+                             disabled=not conf_a):
+                    run("DELETE FROM atestados WHERE id = ?", (int(at["id"]),))
+                    st.success("Atestado excluído.")
+                    st.rerun()
+                st.divider()
+
+
 def pagina_nuvem():
     st.header("☁️ Banco de dados em nuvem")
     url, token = config_nuvem()
@@ -3766,12 +4146,71 @@ def carregar_exemplos():
 #  App principal
 # --------------------------------------------------------------------------- #
 
+def aplicar_estilo():
+    """CSS global — visual azul 'health tech': cards, sombras suaves e cantos arredondados."""
+    st.markdown(
+        """
+<style>
+:root{
+  --cv-primary:#0B6BCB; --cv-primary-d:#084E96; --cv-ink:#15324B;
+  --cv-card:#FFFFFF; --cv-border:#E1E9F2; --cv-muted:#5B7186;
+  --cv-radius:14px; --cv-shadow:0 2px 10px rgba(21,50,75,.07);
+}
+/* esconde o rodapé padrão do Streamlit */
+footer {visibility:hidden;}
+h1{color:var(--cv-ink)!important;font-weight:800!important;letter-spacing:-.5px;}
+h2,h3{color:#1D4E7E!important;}
+/* menu lateral mais limpo */
+section[data-testid="stSidebar"] > div:first-child{
+  background:#FFFFFF;border-right:1px solid var(--cv-border);}
+/* indicadores viram "cards" */
+div[data-testid="stMetric"]{
+  background:var(--cv-card);border:1px solid var(--cv-border);
+  border-radius:var(--cv-radius);padding:14px 18px;box-shadow:var(--cv-shadow);}
+div[data-testid="stMetricLabel"] p{
+  font-weight:600;color:var(--cv-muted);text-transform:uppercase;
+  font-size:.78rem!important;letter-spacing:.4px;}
+div[data-testid="stMetricValue"]{color:var(--cv-primary-d);font-weight:800;}
+/* botões modernos */
+.stButton > button,.stDownloadButton > button{
+  border-radius:10px;font-weight:600;transition:transform .08s ease,box-shadow .12s ease;}
+.stButton > button:hover,.stDownloadButton > button:hover{
+  transform:translateY(-1px);box-shadow:var(--cv-shadow);}
+/* caixas com borda e expansores com cantos arredondados */
+div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:var(--cv-radius);}
+div[data-testid="stExpander"]{
+  border:1px solid var(--cv-border);background:var(--cv-card);
+  border-radius:var(--cv-radius);box-shadow:var(--cv-shadow);}
+div[data-testid="stExpander"] details{border-radius:var(--cv-radius)!important;}
+/* inputs levemente arredondados */
+div[data-baseweb="input"] > div, div[data-baseweb="select"] > div,
+div[data-baseweb="textarea"] > div{border-radius:10px;}
+hr{border-color:var(--cv-border);}
+/* faixa de boas-vindas do Início */
+.cv-hero{
+  background:linear-gradient(120deg,#0B6BCB 0%,#084E96 60%,#0E2A47 100%);
+  border-radius:18px;padding:28px 30px 24px;color:#fff;margin-bottom:1rem;
+  box-shadow:0 6px 24px rgba(11,107,203,.25);}
+.cv-hero h1{color:#fff!important;margin:0 0 2px 0;font-size:2rem;letter-spacing:-.5px;}
+.cv-hero .cv-sub{opacity:.93;font-size:1.02rem;}
+.cv-hero .cv-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;}
+.cv-hero .cv-chip{
+  background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.28);
+  border-radius:999px;padding:4px 14px;font-size:.86rem;font-weight:600;color:#fff;}
+@media (max-width:720px){.cv-hero h1{font-size:1.5rem;}}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 def main():
     st.set_page_config(
         page_title="CARDIOEVET — Gestão Veterinária",
         page_icon="assets/favicon.png" if os.path.exists("assets/favicon.png") else "🐾",
         layout="wide",
     )
+    aplicar_estilo()
     init_db()
 
     if "usuario" not in st.session_state:
@@ -3794,10 +4233,14 @@ def main():
     st.sidebar.divider()
 
     opcoes = ["🏠 Início", "📅 Agenda", "💉 Vacinas", "👤 Tutores", "🐾 Pets",
-              "📋 Histórico", "📎 Exames", "🔬 Laudos", "💰 Financeiro", "🧾 Recibos/NF", "📄 Relatórios"]
+              "📋 Histórico", "📎 Exames", "🔬 Laudos", "📜 Atestados",
+              "💰 Financeiro", "🧾 Recibos/NF", "📄 Relatórios"]
     if eu["papel"] == "admin":
         opcoes += ["🔐 Usuários", "🔏 Assinatura", "☁️ Nuvem"]
-    pagina = st.sidebar.radio("Menu", opcoes)
+    pendente = st.session_state.pop("_nav_pendente", None)
+    if pendente and pendente in opcoes:
+        st.session_state["menu_nav"] = pendente
+    pagina = st.sidebar.radio("Menu", opcoes, key="menu_nav")
 
     st.sidebar.divider()
     with st.sidebar.expander("⚙️ Utilidades"):
@@ -3808,7 +4251,7 @@ def main():
         apagar = st.checkbox("⚠️ Confirmo apagar TODOS os dados (exceto usuários)", key="conf_wipe")
         if st.button("🗑️ Apagar todos os dados", use_container_width=True, disabled=not apagar):
             for tabela in ("lancamentos", "vacinas", "agendamentos", "historico", "anexos",
-                           "laudo_imagens", "laudos", "pets", "tutores"):
+                           "laudo_imagens", "laudos", "atestados", "pets", "tutores"):
                 run(f"DELETE FROM {tabela}")
             st.sidebar.success("Banco de dados limpo! (usuários mantidos)")
             st.rerun()
@@ -3829,6 +4272,8 @@ def main():
         pagina_exames()
     elif pagina == "🔬 Laudos":
         pagina_laudos()
+    elif pagina == "📜 Atestados":
+        pagina_atestados()
     elif pagina == "💰 Financeiro":
         pagina_financeiro()
     elif pagina == "🧾 Recibos/NF":
