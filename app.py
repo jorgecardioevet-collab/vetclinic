@@ -18,6 +18,7 @@ from datetime import date, datetime, time, timedelta
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from fpdf import FPDF
 
 import dbcloud
@@ -1960,8 +1961,11 @@ def pdf_vazio(pdf: FPDF, texto: str):
 
 
 def botao_imprimir_pdf(pdf_bytes: bytes, chave: str, altura: int = 620):
-    """Botão '🖨️ Visualizar / imprimir': mostra o PDF na tela no visualizador do
-    próprio navegador — basta clicar no ícone de impressora (ou Ctrl+P).
+    """Botão '🖨️ Visualizar / imprimir': mostra o PDF na tela.
+
+    O visualizador é montado via JavaScript com **URL de objeto (blob)** — o Chrome
+    bloqueia iframes `data:application/pdf;base64,...`, mas aceita blob URLs da
+    mesma origem. Há também o botão "Abrir em nova guia" como caminho garantido.
 
     `chave` deve ser única por documento/tela.
     """
@@ -1970,14 +1974,39 @@ def botao_imprimir_pdf(pdf_bytes: bytes, chave: str, altura: int = 620):
         st.session_state[k_view] = not st.session_state.get(k_view, False)
     if st.session_state.get(k_view):
         b64 = base64.b64encode(pdf_bytes).decode()
-        st.markdown(
-            f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="{altura}" '
-            f'style="border:1px solid #cfd8d3; border-radius:8px; background:#f8faf9;"></iframe>',
-            unsafe_allow_html=True,
+        components.html(
+            f"""
+            <div style="margin:0 0 6px 0;">
+              <button id="abrirPdf" style="padding:8px 18px; font-size:15px; border-radius:8px;
+                      border:1px solid #166560; background:#ffffff; color:#0c5550;
+                      cursor:pointer; font-weight:600;">
+                🖨️ Abrir em nova guia (recomendado p/ imprimir)
+              </button>
+            </div>
+            <iframe id="pdfv" title="Prévia do PDF" style="width:100%; height:{altura}px;
+                    border:1px solid #cfd8d3; border-radius:8px; background:#f8faf9;"></iframe>
+            <script>
+              (function () {{
+                const b64 = "{b64}";
+                const bin = atob(b64);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                const url = URL.createObjectURL(new Blob([bytes], {{type: "application/pdf"}}));
+                document.getElementById("pdfv").src = url;
+                document.getElementById("abrirPdf").onclick = function () {{
+                  window.open(url, "_blank");
+                }};
+              }})();
+            </script>
+            """,
+            height=altura + 60,
+            scrolling=False,
         )
         st.caption("🖨️ **Para imprimir:** clique no **ícone de impressora** no canto superior "
-                   "direito do visualizador acima — ou pressione **Ctrl+P** (Windows) / "
-                   "**Cmd+P** (Mac). O documento sai idêntico ao PDF.")
+                   "direito do visualizador acima — ou clique em **Abrir em nova guia** e "
+                   "pressione **Ctrl+P** (Windows) / **Cmd+P** (Mac). "
+                   "Como alternativa, o botão **⬇️ Baixar** sempre funciona: abra o PDF baixado "
+                   "e imprima pelo leitor de PDF do computador.")
         if st.button("✖ Fechar visualização", key=f"btn_close_{chave}"):
             st.session_state[k_view] = False
             st.rerun()
