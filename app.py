@@ -232,6 +232,14 @@ CREATE TABLE IF NOT EXISTS atestados (
     texto        TEXT NOT NULL DEFAULT '', -- texto final (editado) do atestado
     criado_em    TEXT DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS modelos_consulta (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    categoria  TEXT NOT NULL,             -- ex.: PACIENTE CARDÍACO
+    nome       TEXT NOT NULL,             -- ex.: Consulta cardiológica completa
+    conteudo   TEXT NOT NULL,             -- texto que preenche a evolução/atendimento
+    criado_em  TEXT DEFAULT (datetime('now', 'localtime'))
+);
 """
 
 
@@ -261,6 +269,7 @@ def init_db():
     else:
         _init_db_local()
     garantir_admin()
+    garantir_modelos_padrao()
 
 
 # --------------------------------------------------------------------------- #
@@ -479,6 +488,133 @@ def garantir_admin():
             "INSERT INTO usuarios (usuario, nome, senha_hash, papel) VALUES (?,?,?,?)",
             ("admin", "Administrador", hash_senha("admin123"), "admin"),
         )
+
+
+# --------------------------------------------------------------------------- #
+#  Modelos de consulta por categoria de paciente (semente inicial)
+# --------------------------------------------------------------------------- #
+
+MODELOS_PADRAO = [
+    ("CONSULTA GERAL", "Avaliação geral",
+     "QUEIXA PRINCIPAL: \n\nHISTÓRICO/ANAMNESE:\n• Apetite: ____ | Ingestão de água: ____ | Urina: ____\n"
+     "• Fezes: ____ | Vômitos: ____\n"
+     "• Medicações em uso: \n\nEXAME FÍSICO:\n• Peso: ____ kg | Temperatura: ____ °C\n"
+     "• FC: ____ bpm | FR: ____ mpm | TPC: ____ s\n• Mucosas: \n"
+     "• Ausculta cardiopulmonar: \n• Linfonodos: \n• Cavidade oral/dentes: \n"
+     "• Palpação abdominal: \n• Pele/pelos: \n\nSUSPEITA DIAGNÓSTICA: \n\nEXAMES SOLICITADOS: \n"
+     "\nCONDUTA / PRESCRIÇÃO: \n\nORIENTAÇÕES AO TUTOR: \n\nRETORNO: "),
+    ("PACIENTE CARDÍACO", "Consulta cardiológica completa",
+     "QUEIXA PRINCIPAL: \n\nANAMNESE:\n• Início dos sinais / progressão: \n"
+     "• Tosse: ____ (horário/piora) | Dispneia/respiração ofegante: ____\n"
+     "• Intolerância ao exercício: ____ | Síncope/desmaios: ____\n"
+     "• Apetite: ____ | Perda de peso: ____\n• Medicações já em uso (dose/posologia): \n\n"
+     "EXAME FÍSICO:\n• Peso: ____ kg | FR de repouso: ____ mpm | FC: ____ bpm\n"
+     "• Mucosas: ____ | TPC: ____ s\n• Ausculta: sopro ____ /6, foco: ____ (esq/dir); "
+     "ritmo: __________\n• Ausculta pulmonar: __________\n"
+     "• Pulso femoral: ____ | Abdome/ascite: \n\nAVALIAÇÃO ECOCARDIOGRÁFICA (resumo — ver laudo): \n\n"
+     "ESTADIAMENTO: ☐ ACVIM A ☐ B1 ☐ B2 ☐ C ☐ D  |  ☐ ISACHC ____\n\n"
+     "SOBRE A DOENÇA / DIAGNÓSTICO: \n\nTERAPÊUTICA (dose, via, intervalo e duração):\n"
+     "• Diurético: \n• IECA: \n• Pimobendana: \n• Outros (espirolactona, antiarrítmico…): \n\n"
+     "ORIENTAÇÕES AO TUTOR (medir FR diária em repouso, sinais de piora, dieta…): \n\n"
+     "RETORNO / CONTROLE: "),
+    ("PACIENTE RENAL", "Avaliação nefrológica",
+     "QUEIXA PRINCIPAL: \n\nANAMNESE:\n• PU/PD (bebe e urina muito): ____\n"
+     "• Volume/características da urina: ____\n• Vômitos: ____ | Diarreia: ____\n"
+     "• Apetite: ____ | Perda de peso: ____\n• Halitose/úlceras bucais: ____\n\n"
+     "EXAME FÍSICO:\n• Hidratação: ____% desidratação estimada\n• Mucosas: ____"
+     "  | PA (se aferida): ____ mmHg\n• Palpação renal (tamanho, simetria, dor): \n\n"
+     "EXAMES (resultados anteriores + solicitados):\n• Ureia: ____ | Creatinina: ____"
+     "  | SDMA: ____\n• Urina: densidade: ____ | proteína/creatinina: ____\n\n"
+     "ESTADIAMENTO IRIS: ☐ I ☐ II ☐ III ☐ IV\n\nCONDUTA:\n"
+     "• Fluidoterapia: ____ mL/kg/dia, via ____, por ____ h\n"
+     "• Dieta renal: \n• Medicamentos: \n• Anti-emético / protetor gástrico: \n\n"
+     "ORIENTAÇÕES AO TUTOR (agua sempre disponível, pesar, sinais…): \n\nRETORNO: "),
+    ("PACIENTE DERMATOLÓGICO", "Avaliação dermatológica",
+     "QUEIXA PRINCIPAL: \n\nANAMNESE:\n• Coceira/prurido (0 a 10): ____/10\n"
+     "• Locais afetados e tempo de evolução: \n• Já ficou pior / estações do ano: \n"
+     "• Outros animais/pessoas da casa: ____\n• Banhos, shampoo, produtos em uso: \n"
+     "• Dieta atual / mudança recente: \n• Tratamentos anteriores e resposta: \n\n"
+     "EXAME FÍSICO (descrever lesões: alopecia, eritema, pápulas, crostas, escamas…): \n\n"
+     "EXAMES REALIZADOS/SOLICITADOS: (raspado, citologia, fita adesiva, lâmpada de Wood, cultura…)\n\n"
+     "DIAGNÓSTICO(S): \n\nCONDUTA / TRATAMENTO: \n• Tópico: \n• Sistêmico: \n"
+     "• Anti-pruriginoso: \n• Colar elizabetano: ☐ sim ☐ não\n\n"
+     "ORIENTAÇÕES AO TUTOR: \n\nRETORNO / REAVALIAÇÃO: "),
+    ("PACIENTE ONCOLÓGICO", "Avaliação oncológica",
+     "QUEIXA PRINCIPAL: (nódulo, massa, verruga, ferida…)\n\nANAMNESE:\n"
+     "• Há quanto tempo notou: ____\n• Crescimento (rápido/lento/estável): ____\n"
+     "• Apetite: ____ | Peso: ____ kg | Perda de peso: ____\n• Outros sinais: \n\n"
+     "EXAME FÍSICO:\n• Massa/nódulo — local: ____, tamanho: ____ x ____ cm, "
+     "consistência: ____, aderido: ☐ sim ☐ não, móvel: ☐ sim ☐ não\n• Outras massas / linfonodos aumentados: \n"
+     "• Linfonodos periféricos: \n\nEXAMES SOLICITADOS:\n• Citologia/biópsia: "
+     "____ (sítio e resultado se já houver)\n• Hemograma / imagem (RX/AP e perfil, USG, TC): \n\n"
+     "DIAGNÓSTICO / ESTADIAMENTO: \n\nPLANO TERAPÊUTICO:\n• ☐ Cirurgia | ☐ Quimioterapia "
+     "| ☐ Cuidados paliativos | ☐ Observação\n• Analgesia/anti-inflamatório: \n\n"
+     "ORIENTAÇÕES AO TUTOR (expectativa realista, sinais de alerta, qualidade de vida): \n\n"
+     "RETORNO / PRÓXIMOS PASSOS: "),
+    ("PACIENTE HEPATOPATA", "Avaliação hepática",
+     "QUEIXA PRINCIPAL: \n\nANAMNESE:\n• Icterícia (pele/mucosas amareladas): ____\n"
+     "• Abdome aumentado / ascite: ____\n• Vômitos: ____ | Diarreia: ____ | PU/PD: ____\n"
+     "• Apetite e perda de peso: \n• Medicações em uso "
+     "(dose/duração — antibióticos, anticonvulsivantes, AINEs…): \n\n"
+     "EXAME FÍSICO:\n• Mucosas: ____ | Dor à palpação cranial de abdome: ____\n"
+     "• Ascite/abdominal distendido: \n\nEXAMES (resultados + solicitados):\n"
+     "• ALT: ____ | FA: ____ | GGT: ____ | Bilirrubinas: ____\n"
+     "• Albumina: ____ | Ácidos biliares: ____\n• USG abdominal: \n\n"
+     "DIAGNÓSTICO / HIPÓTESE: \n\nCONDUTA:\n• Dieta: \n• Hepatoprotetor (silibina, SAMe, "
+     "urso-desoxicólico…): \n• Outros (anti-emético, antibiótico, ITU…): \n\n"
+     "ORIENTAÇÕES AO TUTOR: \n\nRETORNO (controle de enzimas): "),
+    ("PACIENTE DIABÉTICO", "Controle de diabetes",
+     "QUEIXA PRINCIPAL: \n\nANAMNESE:\n• PU/PD: ____ | Polifagia: ____ | Perda de peso: ____\n"
+     "• Insulina atual: tipo ____, dose ____ UI, ____ x/dia, horários: ____\n"
+     "• Alterações recentes (doses erradas, troca de embalagem…): \n"
+     "• Sintomas de hipoglicemia (fraqueza, tremor, convulsão): ____\n"
+     "• Comorbidades (infecções, catarata, outras): \n\nEXAME FÍSICO:\n"
+     "• Peso: ____ kg (meta: ____)\n• Hidratação, mucosas: \n\n"
+     "CONTROLE GLICÊMICO:\n• Glicemia do dia: ____ mg/dL\n• Curva glicêmica / frutosamina: \n\n"
+     "AJUSTE REALIZADO: \n\nORIENTAÇÕES AO TUTOR:\n• Aplicação e rodízio de locais\n"
+     "• Sinais de hipoglicemia — agir rápido (mel/agulha de glicose)\n"
+     "• Alimentação adequada (timing com a insulina)\n\nRETORNO: "),
+    ("PACIENTE ODONTOLÓGICO", "Avaliação odontológica / periodontal",
+     "QUEIXA PRINCIPAL: (halitose, dor, dificuldade para comer, sangramento…)\n\n"
+     "ANAMNESE:\n• Alimentação preferencial (foge de ração dura, come de um lado…): \n"
+     "• Escovação em casa / uso de enxaguante: \n• Últimos procedimentos (limpeza/ exodontias): \n\n"
+     "EXAME FÍSICO BUCAL (descrever por arcada — grau de doença periodontal):\n"
+     "• Cálculo/tártaro: ☐ 0 ☐ I ☐ II ☐ III ☐ IV\n• Gengivite: ____ | Retração gengival: ____\n"
+     "• Dentes com mobilidade / fraturas / lesão de reabsorção dentária (FORL): \n"
+     "• Outras lesões (massa gengival, úlcera, neoplasia): \n\n"
+     "PLANO DO PROCEDIMENTO:\n• ☐ Profilaxia (limpeza) | ☐ Exodontia(s): ____\n"
+     "• ☐ Radiografia odontológica | ☐ Biópsia de massa | ☐ Curetagem\n"
+     "• Sedação/anestesia disponível: ____\n\nCONDUTA MÉDICA:\n• Antibiótico: \n"
+     "• Analgesia: \n\nORIENTAÇÕES AO TUTOR (escovação diária, enxaguante, alimentação pós-procedimento):\n\n"
+     "RETORNO / PRÓXIMA ETAPA: "),
+    ("PACIENTE NEUROLÓGICO", "Avaliação neurológica",
+     "QUEIXA PRINCIPAL: (convulsão, alteração de marcha, dores, paresia, comportamento…)\n\n"
+     "ANAMNESE:\n• Início dos sinais: ____ | Frequência dos episódios de convulsão: ____\n"
+     "• Descrição do episódio (duração, recuperação, mioclonia/generalizada): \n"
+     "• Trauma recente / queda: ____\n• Vacinas/vermífugo em dia: ____\n"
+     "• Sinais de dor (chora ao pegar no colo, desproporção, esconder): \n\n"
+     "EXAME NEUROLÓGICO:\n• Consciência / reação: \n• Marcha: ____ (circling, ataxia, "
+     "trepidação posterior…)\n• Propriocepção / posição consciente: ____\n"
+     "• Reflexos espinais / patelares: ____\n• Nocicepção profunda: ____\n"
+     "• Dor à palpação cervical / torácica / lombar: ____\n• Escores (Frankel / escala de "
+     "paralisia): ____\n\nLOCALIZAÇÃO DA LESÃO (prosencéfalo / médula toracolombar / "
+     "lombossacra / periférica): \n\nEXAMES SOLICITADOS:\n• Hemograma + bioquímica, "
+     "imagem (RX, TC, RM): \n\nCONDUTA:\n• Anticonvulsivante (dose/intervalo/monitoramento hepático): \n"
+     "• Analgesia/anti-inflamatório: \n• Outros: \n\nORIENTAÇÕES AO TUTOR:\n"
+     "• Sinais de emergência (convulsão >5 min, Status epilepticus, dificuldade respiratória)\n"
+     "• Acesso às escadas e contenção em caso de dor\n\nRETORNO: "),
+]
+
+
+def garantir_modelos_padrao():
+    """Semeia os modelos de consulta por categoria na primeira execução (se vazio)."""
+    try:
+        if qdf("SELECT COUNT(*) c FROM modelos_consulta").iloc[0]["c"] == 0:
+            for cat, nome, texto in MODELOS_PADRAO:
+                run("INSERT INTO modelos_consulta (categoria, nome, conteudo) VALUES (?,?,?)",
+                    (cat, nome, texto))
+    except Exception:
+        pass  # não trava o início do app se a tabela ainda não existir
 
 
 def link_whatsapp(telefone: str, mensagem: str) -> str:
@@ -1247,6 +1383,78 @@ def pagina_historico():
 
     st.divider()
     st.subheader("➕ Registrar atendimento")
+
+    # ---- Modelos de consulta por categoria de paciente ---------------------- #
+    if st.session_state.pop("_reset_hist_modelo", None):
+        st.session_state.pop("hist_modelo_txt", None)
+        st.session_state.pop("sel_hist_modelo", None)
+
+    modelos = qdf("SELECT id, categoria, nome, conteudo FROM modelos_consulta "
+                  "ORDER BY categoria, nome")
+    mapa_modelos = {f"{r['categoria']} — {r['nome']}": r["conteudo"]
+                    for _, r in modelos.iterrows()}
+    if mapa_modelos:
+        def _aplicar_modelo_hist():
+            sel = st.session_state.get("sel_hist_modelo")
+            if sel in mapa_modelos:
+                st.session_state["hist_modelo_txt"] = mapa_modelos[sel]
+        st.selectbox(
+            "📋 Modelo de consulta por categoria (opcional)",
+            ["— sem modelo —"] + list(mapa_modelos.keys()),
+            key="sel_hist_modelo", on_change=_aplicar_modelo_hist,
+            help="Ao escolher, a descrição abaixo é preenchida com o roteiro da categoria "
+                 "(renal, cardíaco, dermatológico…). Você pode editar livremente depois. "
+                 "Atenção: a escolha SUBSTITUI o texto atual da descrição.")
+
+    _eu_modelos = st.session_state.get("usuario") or {}
+    if _eu_modelos.get("papel") in ("admin", "veterinario"):
+        with st.expander("🗂 Gerenciar modelos de consulta (criar, editar, excluir)"):
+            cats = sorted(modelos["categoria"].unique().tolist()) if not modelos.empty else []
+            st.markdown("**➕ Criar novo modelo**")
+            if cats:
+                st.caption("Categorias já usadas: " + ", ".join(cats))
+            with st.form("form_novo_modelo_consulta"):
+                n_cat = st.text_input("Categoria *  (ex.: PACIENTE RENAL, PACIENTE OFTALMO…)")
+                n_nome = st.text_input("Nome do modelo *  (ex.: Consulta do paciente renal)")
+                n_cont = st.text_area(
+                    "Conteúdo do modelo *", height=200,
+                    placeholder="Roteiro da consulta — queixa, anamnese, exame físico, "
+                                "exames, conduta, orientações… (use ____ para campos a preencher)")
+                if st.form_submit_button("💾 Salvar novo modelo", type="primary"):
+                    if n_cat.strip() and n_nome.strip() and n_cont.strip():
+                        run("INSERT INTO modelos_consulta (categoria, nome, conteudo) "
+                            "VALUES (?,?,?)",
+                            (n_cat.strip().upper(), n_nome.strip(), n_cont.strip()))
+                        st.success("✅ Modelo criado!"); st.rerun()
+                    else:
+                        st.error("Preencha categoria, nome e conteúdo.")
+
+            st.markdown("**✏️ Editar ou excluir modelo existente**")
+            if modelos.empty:
+                st.info("Nenhum modelo cadastrado ainda.")
+            else:
+                opc_m = {f"#{r['id']} · {r['categoria']} — {r['nome']}": int(r["id"])
+                         for _, r in modelos.iterrows()}
+                sel_m_lbl = st.selectbox("Escolha o modelo", list(opc_m.keys()),
+                                         key="sel_edit_modelo")
+                mid = opc_m[sel_m_lbl]
+                rsel = modelos[modelos["id"] == mid].iloc[0]
+                with st.form(f"form_edit_modelo_{mid}"):
+                    e_cat = st.text_input("Categoria", value=rsel["categoria"])
+                    e_nome = st.text_input("Nome", value=rsel["nome"])
+                    e_cont = st.text_area("Conteúdo", value=rsel["conteudo"], height=240)
+                    if st.form_submit_button("💾 Salvar alterações"):
+                        run("UPDATE modelos_consulta SET categoria=?, nome=?, conteudo=? "
+                            "WHERE id=?",
+                            (e_cat.strip().upper(), e_nome.strip(), e_cont.strip(), mid))
+                        st.success("✅ Modelo atualizado!"); st.rerun()
+                conf_del = st.checkbox("Confirmo excluir permanentemente este modelo",
+                                       key=f"conf_del_modelo_{mid}")
+                if st.button("🗑 Excluir modelo", disabled=not conf_del,
+                             key=f"btn_del_modelo_{mid}"):
+                    run("DELETE FROM modelos_consulta WHERE id=?", (mid,))
+                    st.warning("Modelo excluído."); st.rerun()
+
     with st.form("form_novo_atendimento", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         data = c1.date_input(
@@ -1256,7 +1464,11 @@ def pagina_historico():
         tipo = c2.selectbox("Tipo de atendimento", TIPOS_ATENDIMENTO)
         vet = c3.text_input("Veterinário(a) responsável")
         peso = c1.number_input("Peso no dia (kg) — opcional", min_value=0.0, value=None, step=0.1, format="%.2f")
-        desc = st.text_area("Descrição / anotações *", placeholder="Ex.: Vacina antirrábica aplicada; retorno em 30 dias…")
+        desc = st.text_area("Descrição / anotações *",
+                            value=st.session_state.get("hist_modelo_txt", ""),
+                            height=250,
+                            placeholder="Ex.: Vacina antirrábica aplicada; retorno em 30 dias… "
+                                        "ou escolha um modelo por categoria acima ☝️")
         if st.form_submit_button("💾 Registrar", type="primary"):
             if not desc.strip():
                 st.error("A descrição é obrigatória.")
@@ -1265,6 +1477,7 @@ def pagina_historico():
                     "INSERT INTO historico (pet_id, data, tipo, veterinario, peso_kg, descricao) VALUES (?,?,?,?,?,?)",
                     (pid, data.isoformat(), tipo, vet.strip(), peso, desc.strip()),
                 )
+                st.session_state["_reset_hist_modelo"] = True
                 st.success("Atendimento registrado!")
                 st.rerun()
 
