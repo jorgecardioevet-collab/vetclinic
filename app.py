@@ -7,6 +7,7 @@ Execute com:  streamlit run app.py
 """
 
 import base64
+import csv
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ import os
 import re
 import secrets
 import sqlite3
+import unicodedata
 import urllib.parse
 from datetime import date, datetime, time, timedelta
 
@@ -3965,6 +3967,548 @@ def pagina_atestados():
                 st.divider()
 
 
+# --------------------------------------------------------------------------- #
+#  Página: Importar dados (VetSoft e CSVs compatíveis)
+# --------------------------------------------------------------------------- #
+
+def _norm_txt(s) -> str:
+    return " ".join(str(s if s is not None else "").split()).strip()
+
+
+def _norm_chave(s) -> str:
+    return _norm_txt(s).casefold()
+
+
+def _sem_acento(s: str) -> str:
+    return unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
+
+
+def _achar_col(cabecalho, candidatos):
+    """Acha a coluna do arquivo que melhor corresponde aos nomes candidatos."""
+    norm = {c: _sem_acento(c).casefold() for c in cabecalho}
+    cand = [_sem_acento(x).casefold() for x in candidatos]
+    for alvo in cand:                      # correspondência exata primeiro
+        for nome, n in norm.items():
+            if n == alvo:
+                return nome
+    for alvo in cand:                      # depois "contém"
+        for nome, n in norm.items():
+            if alvo and alvo in n:
+                return nome
+    return None
+
+
+def _parse_data_iso(s) -> str | None:
+    s = _norm_txt(s).split(" ")[0].split("T")[0]
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_peso(s) -> float | None:
+    s = re.sub(r"[^0-9,.\-]", "", _norm_txt(s)).replace(",", ".")
+    try:
+        v = float(s)
+        return v if v > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _ler_csv_upload(upload):
+    """Lê CSV/TXT em padrão VetSoft (ponto-e-vírgula, UTF-8) ou semelhante."""
+    bruto = upload.getvalue()
+    txt = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            txt = bruto.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if txt is None:
+        raise ValueError("não foi possível ler a codificação do arquivo")
+    try:
+        dialecto = csv.Sniffer().sniff(txt[:4096], delimiters=";,\t|")
+    except csv.Error:
+        dialecto = csv.excel
+    linhas = [l for l in csv.reader(io.StringIO(txt), dialecto) if any(c.strip() for c in l)]
+    if len(linhas) < 2:
+        raise ValueError("arquivo sem linhas de dados")
+    cab = [_norm_txt(c) for c in linhas[0]]
+    return cab, linhas[1:]
+
+
+def _montar_endereco(linha, cab, idx):
+    """Junta rua, número, complemento, bairro e cidade/UF em um endereço só."""
+    def get(candidatos):
+        col = _achar_col(cab, candidatos)
+        return _norm_txt(linha[idx[col]]) if col is not None else ""
+    rua = get(["endereco", "endereço", "logradouro", "rua"])
+    num = get(["numero", "número", "nº", "num"])
+    compl = get(["complemento", "compl"])
+    bairro = get(["bairro"])
+    cidade = get(["cidade", "municipio", "município"])
+    uf = get(["estado", "uf"])
+    partes = []
+    if rua:
+        partes.append(rua + (f", {num}" if num else "") + (f", {compl}" if compl else ""))
+    elif num:
+        partes.append(num)
+    if bairro:
+        partes.append(bairro)
+    if cidade:
+        partes.append(cidade + (f"/{uf}" if uf else ""))
+    return " — ".join(partes)
+
+
+def pagina_importar():
+    st.header("📥 Importar dados (VetSoft / planilhas)")
+    st.caption("Importe os arquivos **CSV exportados do sistema antigo** (VetSoft ou qualquer "
+               "planilha). Ordem recomendada: **1) Clientes → 2) Pacientes → 3) Atendimentos/Vacinas** — "
+               "assim cada pet encontra o tutor certo. Nada é importado sem a sua conferência final.")
+
+    up = st.file_uploader("Escolha o arquivo CSV (.csv ou .txt)", type=["csv", "txt"], key="imp_up")
+    if not up:
+        st.info("⬆️ Comece enviando o arquivo exportado (ex.: `0008-Clientes.csv` do VetSoft).")
+        return
+    try:
+        cab, linhas = _ler_csv_upload(up)
+    except Exception as e:
+        st.error(f"Não consegui ler o arquivo: {e}")
+        return
+
+    st.success(f"✅ Arquivo lido: **{len(linhas)} registro(s)** e {len(cab)} coluna(s).")
+    with st.expander("👀 Prévia do arquivo (primeiras linhas)"):
+        st.dataframe(pd.DataFrame(linhas[:8], columns=cab), hide_index=True,
+                     use_container_width=True)
+
+    idx = {c: i for i, c in enumerate(cab)}
+
+    def val(linha, col):
+        return _norm_txt(linha[idx[col]]) if col and col in idx else ""
+
+    # ---- Escolha do tipo de conteúdo ---------------------------------------- #
+    tem_pet = _achar_col(cab, ["animal", "paciente", "pet", "nome do animal"])
+    palpite = 1 if tem_pet else 0
+    tipo = st.radio("O que este arquivo contém?",
+                    ["👤 Clientes (tutores)", "🐾 Pacientes (pets)", "📋 Atendimentos (histórico)",
+                     "💉 Vacinas"], index=palpite, horizontal=True, key="imp_tipo")
+
+    col_opts = ["— não importar —"] + cab
+
+    def mapear(rotulo, candidatos, obrig=False):
+        padrao = _achar_col(cab, candidatos)
+        return st.selectbox(f"{'🔴 ' if obrig else ''}{rotulo}", col_opts,
+                            index=col_opts.index(padrao) if padrao in col_opts else 0,
+                            key=f"imp_map_{tipo}_{rotulo}")
+
+    # ========================================================================= #
+    #  TUTORES                                                                  #
+    # ========================================================================= #
+    if tipo.startswith("👤"):
+        st.markdown("**Como as colunas do arquivo entram no CARDIOEVET:**")
+        c1, c2 = st.columns(2)
+        m_nome = c1.selectbox("🔴 Nome do tutor", col_opts,
+                              index=col_opts.index(_achar_col(cab, ["nome", "cliente", "nome completo"]))
+                              if _achar_col(cab, ["nome", "cliente", "nome completo"]) in col_opts else 0,
+                              key="imp_t_nome")
+        m_tel = c2.selectbox("Telefone", col_opts,
+                             index=col_opts.index(_achar_col(cab, ["celular", "telefone", "whatsapp", "fone"]))
+                             if _achar_col(cab, ["celular", "telefone", "whatsapp", "fone"]) in col_opts else 0,
+                             key="imp_t_tel")
+        c1, c2 = st.columns(2)
+        m_email = c1.selectbox("E-mail", col_opts,
+                               index=col_opts.index(_achar_col(cab, ["e-mail", "email"]))
+                               if _achar_col(cab, ["e-mail", "email"]) in col_opts else 0,
+                               key="imp_t_email")
+        m_cpf = c2.selectbox("CPF", col_opts,
+                             index=col_opts.index(_achar_col(cab, ["cpf"]))
+                             if _achar_col(cab, ["cpf"]) in col_opts else 0,
+                             key="imp_t_cpf")
+        end_opts = ["🧩 Montar endereço completo (rua + nº + compl. + bairro + cidade/UF)"] + col_opts
+        m_end = st.selectbox("Endereço", end_opts,
+                             index=0 if _achar_col(cab, ["endereco", "endereço", "logradouro"]) else 1,
+                             key="imp_t_end")
+        c1, c2 = st.columns(2)
+        m_obs = c1.selectbox("Observações", col_opts,
+                             index=col_opts.index(_achar_col(cab, ["observacao", "observação", "obs"]))
+                             if _achar_col(cab, ["observacao", "observação", "obs"]) in col_opts else 0,
+                             key="imp_t_obs")
+        m_cod = c2.selectbox("Código do cliente **recomendado** — guardado p/ conectar os pets depois",
+                             col_opts,
+                             index=col_opts.index(_achar_col(cab, ["codigo", "código", "id"]))
+                             if _achar_col(cab, ["codigo", "código", "id"]) in col_opts else 0,
+                             key="imp_t_cod")
+        col_sit = _achar_col(cab, ["situacao", "situação", "status"])
+        so_ativos = True
+        if col_sit:
+            so_ativos = st.checkbox(f"Importar apenas registros ativos (coluna “{col_sit}”)",
+                                    value=True, key="imp_t_ativos")
+
+        amostras = []
+        for r in linhas[:3]:
+            amostras.append({
+                "nome": val(r, m_nome), "telefone": val(r, m_tel), "cpf": val(r, m_cpf),
+                "endereco": _montar_endereco(r, cab, idx) if m_end.startswith("🧩") else val(r, m_end),
+                "codigo": val(r, m_cod),
+            })
+        with st.expander("🔎 Como vai ficar (exemplos)"):
+            st.dataframe(pd.DataFrame(amostras), hide_index=True, use_container_width=True)
+
+        if not m_nome or m_nome.startswith("—"):
+            st.error("Escolha a coluna do **Nome do tutor**.")
+            return
+        if st.button(f"🚀 Importar {len(linhas)} cliente(s) agora", type="primary", key="imp_go_t"):
+            ins = dup = pul = 0
+            erros = []
+            existentes = {_norm_chave(r["nome"]) for r in
+                          qdf("SELECT nome FROM tutores").to_dict("records")}
+            mapa = json.loads(get_config("imp_vetsoft_map", "{}") or "{}")
+            barra = st.progress(0.0)
+            for i, r in enumerate(linhas):
+                barra.progress((i + 1) / len(linhas))
+                nome = val(r, m_nome)
+                if not nome:
+                    erros.append(f"linha {i + 2}: sem nome")
+                    continue
+                if col_sit and so_ativos and _norm_chave(val(r, col_sit)) != "ativo":
+                    pul += 1
+                    continue
+                if _norm_chave(nome) in existentes:
+                    dup += 1
+                    continue
+                end = _montar_endereco(r, cab, idx) if m_end.startswith("🧩") else val(r, m_end)
+                run("INSERT INTO tutores (nome, telefone, email, cpf, endereco, observacoes)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (nome, val(r, m_tel), val(r, m_email), val(r, m_cpf), end, val(r, m_obs)))
+                novo_id = int(qdf("SELECT MAX(id) m FROM tutores").iloc[0]["m"])
+                cod = val(r, m_cod)
+                if cod:
+                    mapa[cod] = novo_id
+                existentes.add(_norm_chave(nome))
+                ins += 1
+            barra.empty()
+            set_config("imp_vetsoft_map", json.dumps(mapa))
+            st.success(f"🎉 **{ins} tutor(es) importado(s)!** "
+                       f"({dup} já existiam e foram pulados, {pul} inativos ignorados)")
+            if erros:
+                st.warning(f"{len(erros)} linha(s) com problema (sem nome) foram puladas.")
+            st.balloons()
+
+    # ========================================================================= #
+    #  PETS                                                                     #
+    # ========================================================================= #
+    elif tipo.startswith("🐾"):
+        mapa = json.loads(get_config("imp_vetsoft_map", "{}") or "{}")
+        st.markdown("**Como as colunas do arquivo entram no CARDIOEVET:**")
+        c1, c2 = st.columns(2)
+        m_nome = c1.selectbox("🔴 Nome do pet", col_opts,
+                              index=col_opts.index(_achar_col(cab, ["animal", "paciente", "pet", "nome do animal", "nome"]))
+                              if _achar_col(cab, ["animal", "paciente", "pet", "nome do animal", "nome"]) in col_opts else 0,
+                              key="imp_p_nome")
+        m_esp = c2.selectbox("Espécie", col_opts,
+                             index=col_opts.index(_achar_col(cab, ["especie", "espécie"]))
+                             if _achar_col(cab, ["especie", "espécie"]) in col_opts else 0,
+                             key="imp_p_esp")
+        c1, c2 = st.columns(2)
+        m_raca = c1.selectbox("Raça", col_opts,
+                              index=col_opts.index(_achar_col(cab, ["raca", "raça"]))
+                              if _achar_col(cab, ["raca", "raça"]) in col_opts else 0,
+                              key="imp_p_raca")
+        m_sexo = c2.selectbox("Sexo", col_opts,
+                              index=col_opts.index(_achar_col(cab, ["sexo", "genero", "gênero"]))
+                              if _achar_col(cab, ["sexo", "genero", "gênero"]) in col_opts else 0,
+                              key="imp_p_sexo")
+        c1, c2 = st.columns(2)
+        m_nasc = c1.selectbox("Data de nascimento", col_opts,
+                              index=col_opts.index(_achar_col(cab, ["nascimento", "data de nascimento", "dt nascimento"]))
+                              if _achar_col(cab, ["nascimento", "data de nascimento", "dt nascimento"]) in col_opts else 0,
+                              key="imp_p_nasc")
+        m_peso = c2.selectbox("Peso (kg)", col_opts,
+                              index=col_opts.index(_achar_col(cab, ["peso", "peso (kg)", "kg"]))
+                              if _achar_col(cab, ["peso", "peso (kg)", "kg"]) in col_opts else 0,
+                              key="imp_p_peso")
+        st.markdown("**Conexão com o tutor:** use o **código** do cliente quando houver "
+                    f"({len(mapa)} código(s) já conhecido(s) da importação de clientes).")
+        c1, c2 = st.columns(2)
+        m_cod = c1.selectbox("Código do tutor/cliente", col_opts,
+                             index=col_opts.index(_achar_col(cab, ["codigo do cliente", "código do cliente",
+                                                                   "codigo cliente", "cliente (código)",
+                                                                   "codigo do tutor", "responsavel (codigo)",
+                                                                   "código do responsável", "codigo"]))
+                             if _achar_col(cab, ["codigo do cliente", "código do cliente", "codigo cliente",
+                                                 "cliente (código)", "codigo do tutor", "responsavel (codigo)",
+                                                 "código do responsável", "codigo"]) in col_opts else 0,
+                             key="imp_p_cod")
+        m_tutor_nome = c2.selectbox("Nome do tutor (alternativa ao código)", col_opts,
+                                    index=col_opts.index(_achar_col(cab, ["cliente", "tutor", "responsavel",
+                                                                          "responsável", "dono", "proprietario"]))
+                                    if _achar_col(cab, ["cliente", "tutor", "responsavel", "responsável",
+                                                        "dono", "proprietario"]) in col_opts else 0,
+                                    key="imp_p_tut")
+        m_obs = st.selectbox("Observações", col_opts,
+                             index=col_opts.index(_achar_col(cab, ["observacao", "observação", "obs"]))
+                             if _achar_col(cab, ["observacao", "observação", "obs"]) in col_opts else 0,
+                             key="imp_p_obs")
+
+        tutores_banco = {(_norm_chave(r["nome"])): int(r["id"])
+                         for r in qdf("SELECT id, nome FROM tutores").to_dict("records")}
+        if not tutores_banco:
+            st.warning("⚠️ Nenhum tutor cadastrado ainda — **importe primeiro o arquivo de Clientes** "
+                       "ou cadastre os tutores manualmente.")
+
+        if not m_nome or m_nome.startswith("—"):
+            st.error("Escolha a coluna do **Nome do pet**.")
+            return
+        if st.button(f"🚀 Importar {len(linhas)} paciente(s) agora", type="primary", key="imp_go_p"):
+            existentes = {(_norm_chave(r["nome"]), int(r["tutor_id"])) for r in
+                          qdf("SELECT nome, tutor_id FROM pets").to_dict("records")}
+            ins = dup = sem_tutor = 0
+            faltantes = set()
+            barra = st.progress(0.0)
+            for i, r in enumerate(linhas):
+                barra.progress((i + 1) / len(linhas))
+                nome = val(r, m_nome)
+                if not nome:
+                    continue
+                tid = None
+                cod = val(r, m_cod)
+                if cod and str(cod) in mapa:
+                    tid = int(mapa[str(cod)])
+                elif val(r, m_tutor_nome):
+                    tid = tutores_banco.get(_norm_chave(val(r, m_tutor_nome)))
+                if not tid:
+                    sem_tutor += 1
+                    faltantes.add(val(r, m_tutor_nome) or cod or "—")
+                    continue
+                if (_norm_chave(nome), tid) in existentes:
+                    dup += 1
+                    continue
+                sx = val(r, m_sexo)
+                sx = ({"m": "Macho", "macho": "Macho", "f": "Fêmea", "femea": "Fêmea",
+                       "fêmea": "Fêmea"}.get(_norm_chave(sx), sx.title() if sx else None))
+                run("""INSERT INTO pets (tutor_id, nome, especie, raca, sexo, nascimento, peso,
+                                       observacoes) VALUES (?,?,?,?,?,?,?,?)""",
+                    (tid, nome, val(r, m_esp) or None, val(r, m_raca) or None, sx,
+                     _parse_data_iso(val(r, m_nasc)), _parse_peso(val(r, m_peso)),
+                     val(r, m_obs) or None))
+                existentes.add((_norm_chave(nome), tid))
+                ins += 1
+            barra.empty()
+            st.success(f"🎉 **{ins} pet(s) importado(s)!** "
+                       f"({dup} já existiam e foram pulados)")
+            if sem_tutor:
+                st.warning(f"⚠️ **{sem_tutor} pet(s) NÃO foram importados** porque o tutor não foi "
+                           "encontrado. Confira se os clientes foram importados primeiro "
+                           f"(códigos/nomes não localizados, ex.: {', '.join(list(faltantes)[:5])}).")
+            st.balloons()
+
+    # ========================================================================= #
+    #  HISTÓRICO / VACINAS (vinculados ao pet pelo nome)                         #
+    # ========================================================================= #
+    else:
+        e_vacina = tipo.startswith("💉")
+        st.caption("O vínculo é feito **pelo nome do pet** (o sistema procura o pet com nome igual "
+                   "no cadastro). Importe os pacientes antes.")
+        c1, c2 = st.columns(2)
+        m_pet = c1.selectbox("🔴 Nome do pet", col_opts,
+                             index=col_opts.index(_achar_col(cab, ["animal", "paciente", "pet", "nome do animal"]))
+                             if _achar_col(cab, ["animal", "paciente", "pet", "nome do animal"]) in col_opts else 0,
+                             key="imp_h_pet")
+        if e_vacina:
+            m_campo2 = c2.selectbox("🔴 Vacina / produto", col_opts,
+                                    index=col_opts.index(_achar_col(cab, ["vacina", "produto", "imunizante", "nome"]))
+                                    if _achar_col(cab, ["vacina", "produto", "imunizante", "nome"]) in col_opts else 0,
+                                    key="imp_v_vac")
+        else:
+            m_campo2 = c2.selectbox("Tipo de atendimento", col_opts,
+                                    index=col_opts.index(_achar_col(cab, ["tipo", "procedimento", "servico", "serviço"]))
+                                    if _achar_col(cab, ["tipo", "procedimento", "servico", "serviço"]) in col_opts else 0,
+                                    key="imp_h_tipo")
+        c1, c2 = st.columns(2)
+        m_data = c1.selectbox("🔴 Data", col_opts,
+                              index=col_opts.index(_achar_col(cab, ["data", "data de aplicacao", "data de aplicação",
+                                                                    "data do atendimento"]))
+                              if _achar_col(cab, ["data", "data de aplicacao", "data de aplicação",
+                                                  "data do atendimento"]) in col_opts else 0,
+                              key="imp_h_data")
+        if e_vacina:
+            m_prox = c2.selectbox("Próxima dose / reforço", col_opts,
+                                  index=col_opts.index(_achar_col(cab, ["proxima dose", "próxima dose",
+                                                                        "recomendada", "vencimento", "retorno"]))
+                                  if _achar_col(cab, ["proxima dose", "próxima dose", "recomendada",
+                                                      "vencimento", "retorno"]) in col_opts else 0,
+                                  key="imp_v_prox")
+        else:
+            m_prox = c2.selectbox("Veterinário(a)", col_opts,
+                                  index=col_opts.index(_achar_col(cab, ["veterinario", "veterinário",
+                                                                        "profissional", "medico", "médico"]))
+                                  if _achar_col(cab, ["veterinario", "veterinário", "profissional",
+                                                      "medico", "médico"]) in col_opts else 0,
+                                  key="imp_h_vet")
+        m_desc = st.selectbox("Descrição / observações", col_opts,
+                              index=col_opts.index(_achar_col(cab, ["descricao", "descrição", "observacao",
+                                                                    "observação", "anamnese", "obs"]))
+                              if _achar_col(cab, ["descricao", "descrição", "observacao", "observação",
+                                                  "anamnese", "obs"]) in col_opts else 0,
+                              key="imp_h_desc")
+
+        pets_banco = {}
+        for r in qdf("SELECT id, nome FROM pets").to_dict("records"):
+            pets_banco.setdefault(_norm_chave(r["nome"]), int(r["id"]))
+        if not pets_banco:
+            st.warning("⚠️ Nenhum pet cadastrado ainda — importe Clientes e Pacientes primeiro.")
+
+        if (not m_pet or m_pet.startswith("—")) or (e_vacina and (not m_campo2 or m_campo2.startswith("—"))) \
+                or (not m_data or m_data.startswith("—")):
+            st.error("Escolha pelo menos: nome do pet, " + ("vacina, " if e_vacina else "") + "e data.")
+            return
+        if st.button(f"🚀 Importar {len(linhas)} registro(s) agora", type="primary", key="imp_go_h"):
+            ins = sem_pet = 0
+            faltantes = set()
+            barra = st.progress(0.0)
+            for i, r in enumerate(linhas):
+                barra.progress((i + 1) / len(linhas))
+                pet_nome = val(r, m_pet)
+                pid = pets_banco.get(_norm_chave(pet_nome))
+                if not pid:
+                    sem_pet += 1
+                    if pet_nome:
+                        faltantes.add(pet_nome)
+                    continue
+                data_iso = _parse_data_iso(val(r, m_data)) or date.today().isoformat()
+                if e_vacina:
+                    run("""INSERT INTO vacinas (pet_id, vacina, data_aplicacao, proxima_dose, observacao)
+                           VALUES (?,?,?,?,?)""",
+                        (pid, val(r, m_campo2), data_iso,
+                         _parse_data_iso(val(r, m_prox)), val(r, m_desc) or None))
+                else:
+                    run("""INSERT INTO historico (pet_id, data, tipo, veterinario, descricao)
+                           VALUES (?,?,?,?,?)""",
+                        (pid, data_iso, val(r, m_campo2) or "Atendimento",
+                         val(r, m_prox), trunc(val(r, m_desc) or "Importado do sistema anterior", 480)))
+                ins += 1
+            barra.empty()
+            st.success(f"🎉 **{ins} registro(s) importado(s)!**")
+            if sem_pet:
+                st.warning(f"⚠️ {sem_pet} linha(s) puladas: pet não encontrado no cadastro "
+                           f"(ex.: {', '.join(list(faltantes)[:5])}). Confira os nomes.")
+            st.balloons()
+
+
+# --------------------------------------------------------------------------- #
+#  Backup completo (.zip com CSVs + arquivos)
+# --------------------------------------------------------------------------- #
+
+TABELAS_BACKUP = ["tutores", "pets", "vacinas", "agendamentos", "historico", "anexos",
+                  "laudos", "laudo_imagens", "atestados", "lancamentos", "servicos",
+                  "receitas_seq_dummy"]  # dummy removido na iteração
+TABELAS_BACKUP = [t for t in TABELAS_BACKUP if t != "receitas_seq_dummy"]
+
+
+def _csv_bom(df: pd.DataFrame) -> bytes:
+    """CSV pronto p/ Excel pt-BR (ponto-e-vírgula + BOM) e compatível com 📥 Importar."""
+    return df.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
+
+
+def gerar_backup_zip(incluir_cert: bool, prog_barra=None) -> bytes:
+    """Compacta todas as tabelas (CSV) + anexos e imagens de laudo (arquivos) num .zip."""
+    import zipfile
+    buf = io.BytesIO()
+    etapas = len(TABELAS_BACKUP) + 3
+    feito = [0]
+
+    def passo(txt=""):
+        feito[0] += 1
+        if prog_barra is not None:
+            prog_barra.progress(min(feito[0] / etapas, 1.0), text=txt)
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        # ---- tabelas em CSV ------------------------------------------------- #
+        for t in TABELAS_BACKUP:
+            try:
+                df = qdf(f"SELECT * FROM {t}")
+            except Exception:
+                df = pd.DataFrame()
+            for col in ("dados",):           # blobs viram referência (arquivo separado)
+                if col in df.columns:
+                    df[col] = df[col].map(
+                        lambda v: (f"<< conteúdo no arquivo da pasta '{t}/' >>" if v else ""))
+            z.writestr(f"dados/{t}.csv", _csv_bom(df))
+            passo(f"Exportando tabela {t}…")
+
+        # ---- config e usuários ---------------------------------------------- #
+        try:
+            cfg = qdf("SELECT chave, valor FROM config")
+            cfg["valor"] = cfg["valor"].map(
+                lambda v: ("<<valor binário>>" if isinstance(v, (bytes, bytearray))
+                           else str(v) if v is not None else ""))
+            z.writestr("dados/config.csv", _csv_bom(cfg))
+        except Exception:
+            pass
+        try:
+            usu = qdf("SELECT id, usuario, nome, senha_hash, papel, criado_em FROM usuarios")
+            z.writestr("dados/usuarios.csv", _csv_bom(usu))
+        except Exception:
+            pass
+        passo("Exportando configurações…")
+
+        # ---- anexos (arquivos reais) ----------------------------------------- #
+        anx = qdf("SELECT id, nome FROM anexos")
+        for _, r in anx.iterrows():
+            try:
+                b = _ler_blob("anexos", int(r["id"]))
+                nome_seg = re.sub(r"[^\w.\- ()]+", "_", str(r["nome"] or "arquivo"))
+                z.writestr(f"anexos/{int(r['id'])}_{nome_seg}", b)
+            except Exception as e:
+                z.writestr(f"anexos/ERRO_{int(r['id'])}.txt", f"Não foi possível exportar: {e}")
+        passo(f"Exportando {len(anx)} anexo(s)…")
+
+        # ---- imagens dos laudos ---------------------------------------------- #
+        imgs = qdf("SELECT id FROM laudo_imagens")
+        for _, r in imgs.iterrows():
+            try:
+                b = _ler_blob("laudo_imagens", int(r["id"]))
+                z.writestr(f"laudo_imagens/{int(r['id'])}.jpg", b)
+            except Exception as e:
+                z.writestr(f"laudo_imagens/ERRO_{int(r['id'])}.txt", f"Não foi possível exportar: {e}")
+        passo(f"Exportando {len(imgs)} imagem(ns) de laudos…")
+
+        # ---- certificado digital (opcional) ---------------------------------- #
+        if incluir_cert and get_config("cert_pfx"):
+            try:
+                z.writestr("certificado/certificado_a1.pfx", bytes(get_config("cert_pfx")))
+            except Exception:
+                pass
+
+        # ---- LEIA-ME ---------------------------------------------------------- #
+        hoje = datetime.now().strftime("%d/%m/%Y %H:%M")
+        z.writestr("LEIA-ME.txt", (
+            f"BACKUP CARDIOEVET — gerado em {hoje}\n"
+            "=========================================\n\n"
+            "CONTEÚDO DESTE ARQUIVO:\n"
+            "• pasta 'dados/' ......... todas as tabelas do sistema em CSV "
+            "(abrem no Excel; compatíveis com a tela 📥 Importar do app)\n"
+            "• pasta 'anexos/' ........ os arquivos enviados na aba Exames (PDFs, imagens…)\n"
+            "• pasta 'laudo_imagens/' . as imagens JPG anexadas aos laudos\n"
+            + ("• pasta 'certificado/' ... seu certificado digital A1\n" if incluir_cert else "")
+            + "\nCOMO USAR:\n"
+            "1) Guarde este arquivo em 2 lugares (computador + Google Drive/pendrive).\n"
+            "2) Faça um novo backup todo mês (sugestão: primeiro dia útil do mês).\n"
+            "3) Para conferir: abra qualquer CSV da pasta 'dados' no Excel.\n"
+            "4) Para restaurar em outro sistema/instalação, use a tela 📥 Importar do app "
+            "(Clientes → Pacientes → demais tabelas) ou peça ajuda técnica.\n\n"
+            "⚠️ PRIVACIDADE (LGPD): este arquivo contém dados pessoais dos tutores"
+            + (" e seu CERTIFICADO DIGITAL." if incluir_cert else ".")
+            + " Guarde-o protegido por senha e não o compartilhe.\n"
+        ))
+    return buf.getvalue()
+
+
 def pagina_nuvem():
     st.header("☁️ Banco de dados em nuvem")
     url, token = config_nuvem()
@@ -3977,6 +4521,37 @@ def pagina_nuvem():
         )
     else:
         st.info("💾 **Modo local ativo** — os dados ficam apenas no arquivo `vetclinic.db` deste servidor.")
+
+    # ---- Backup completo ----------------------------------------------------- #
+    with st.container(border=True):
+        st.markdown("### 💾 Backup completo dos dados")
+        st.caption("Baixa **tudo** do sistema num único arquivo `.zip`: todas as tabelas em "
+                   "planilhas (abrem no Excel e até reimportam pela tela 📥 Importar), os anexos "
+                   "dos exames e as imagens dos laudos. **Sugestão: faça 1 backup por mês** e "
+                   "guarde em 2 lugares (computador + Google Drive).")
+        incluir_cert = st.checkbox(
+            "Incluir meu certificado digital A1 (.pfx) no backup",
+            value=False,
+            help="Deixe desmarcado por padrão — só marque se for guardar o backup em local "
+                 "bem protegido. O arquivo .pfx protege sua assinatura digital.")
+        if st.button("📦 Gerar backup agora", type="primary", key="btn_gerar_backup"):
+            barra = st.progress(0.0, text="Preparando…")
+            with st.spinner("Gerando o backup — com muitos anexos pode levar 1 a 2 minutos…"):
+                try:
+                    st.session_state["backup_zip"] = gerar_backup_zip(incluir_cert, barra)
+                    st.session_state["backup_ok"] = True
+                except Exception as e:
+                    st.session_state.pop("backup_zip", None)
+                    st.error(f"❌ Não foi possível gerar o backup: {e}")
+            barra.empty()
+            st.rerun()
+        if st.session_state.get("backup_zip"):
+            n = len(st.session_state["backup_zip"]) / 1_000_000
+            st.success(f"✅ Backup pronto! Tamanho: {n:.1f} MB. "
+                       "Clique no botão abaixo para baixar e guarde em local seguro.")
+            st.download_button("⬇️ Baixar backup (.zip)", st.session_state["backup_zip"],
+                               f"backup_cardioevet_{date.today().isoformat()}.zip",
+                               "application/zip", type="primary", key="dl_backup")
 
     with st.expander("ℹ️ Como configurar (passo a passo)", expanded=not ativo):
         st.markdown(
@@ -4236,7 +4811,7 @@ def main():
               "📋 Histórico", "📎 Exames", "🔬 Laudos", "📜 Atestados",
               "💰 Financeiro", "🧾 Recibos/NF", "📄 Relatórios"]
     if eu["papel"] == "admin":
-        opcoes += ["🔐 Usuários", "🔏 Assinatura", "☁️ Nuvem"]
+        opcoes += ["🔐 Usuários", "🔏 Assinatura", "📥 Importar", "☁️ Nuvem"]
     pendente = st.session_state.pop("_nav_pendente", None)
     if pendente and pendente in opcoes:
         st.session_state["menu_nav"] = pendente
@@ -4282,6 +4857,8 @@ def main():
         pagina_usuarios()
     elif pagina == "🔏 Assinatura":
         pagina_assinatura()
+    elif pagina == "📥 Importar":
+        pagina_importar()
     elif pagina == "☁️ Nuvem":
         pagina_nuvem()
     else:
