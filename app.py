@@ -4065,11 +4065,34 @@ def _montar_endereco(linha, cab, idx):
     return " — ".join(partes)
 
 
+def _infer_especie_raca(txt: str):
+    """Infere espécie pela raça (VetSoft: "SRD (felino)" → Gato) e devolve (espécie, raça limpa).
+
+    Retorna espécie "" quando nada foi detectado no texto."""
+    bruto = _norm_txt(txt)
+    baixo = _sem_acento(_norm_chave(bruto))
+    esp = ""
+    if any(k in baixo for k in ("felino", "felina", "gato", "gata", "persa", "siames")):
+        esp = "Gato"
+    elif any(k in baixo for k in ("canino", "canina")):
+        esp = "Cão"
+    raca = re.sub(r"\s*\((canino|canina|felino|felina)\)\s*", " ", bruto,
+                  flags=re.IGNORECASE)
+    raca = _norm_txt(raca)
+    return esp, (raca if raca and raca != bruto else bruto)
+
+
+def _eh_coluna(col) -> bool:
+    """True quando o selectbox de mapeamento aponta para uma coluna real."""
+    return bool(col) and not str(col).startswith("—")
+
+
 def pagina_importar():
     st.header("📥 Importar dados (VetSoft / planilhas)")
     st.caption("Importe os arquivos **CSV exportados do sistema antigo** (VetSoft ou qualquer "
-               "planilha). Ordem recomendada: **1) Clientes → 2) Pacientes → 3) Atendimentos/Vacinas** — "
-               "assim cada pet encontra o tutor certo. Nada é importado sem a sua conferência final.")
+               "planilha). Ordem recomendada: **1) Clientes → 2) Contatos → 3) Pacientes → "
+               "4) Atendimentos/Vacinas** — assim cada pet encontra o tutor certo. "
+               "Nada é importado sem a sua conferência final.")
 
     up = st.file_uploader("Escolha o arquivo CSV (.csv ou .txt)", type=["csv", "txt"], key="imp_up")
     if not up:
@@ -4092,11 +4115,21 @@ def pagina_importar():
         return _norm_txt(linha[idx[col]]) if col and col in idx else ""
 
     # ---- Escolha do tipo de conteúdo ---------------------------------------- #
+    opcoes_tipo = ["👤 Clientes (tutores)", "📞 Contatos (telefones/e-mails)",
+                   "🐾 Pacientes (pets)", "📋 Atendimentos (histórico)", "💉 Vacinas"]
+    tem_raca = _achar_col(cab, ["raca", "raça"])
     tem_pet = _achar_col(cab, ["animal", "paciente", "pet", "nome do animal"])
-    palpite = 1 if tem_pet else 0
-    tipo = st.radio("O que este arquivo contém?",
-                    ["👤 Clientes (tutores)", "🐾 Pacientes (pets)", "📋 Atendimentos (histórico)",
-                     "💉 Vacinas"], index=palpite, horizontal=True, key="imp_tipo")
+    eh_contatos = (_achar_col(cab, ["valor"]) and
+                   _achar_col(cab, ["contato", "tipo"]) and
+                   not tem_raca and not tem_pet)
+    if tem_raca or tem_pet:
+        palpite = 2
+    elif eh_contatos:
+        palpite = 1
+    else:
+        palpite = 0
+    tipo = st.radio("O que este arquivo contém?", opcoes_tipo,
+                    index=palpite, horizontal=True, key="imp_tipo")
 
     col_opts = ["— não importar —"] + cab
 
@@ -4175,7 +4208,8 @@ def pagina_importar():
                 if not nome:
                     erros.append(f"linha {i + 2}: sem nome")
                     continue
-                if col_sit and so_ativos and _norm_chave(val(r, col_sit)) != "ativo":
+                if col_sit and so_ativos and val(r, col_sit) \
+                        and _norm_chave(val(r, col_sit)) != "ativo":
                     pul += 1
                     continue
                 if _norm_chave(nome) in existentes:
@@ -4197,6 +4231,116 @@ def pagina_importar():
                        f"({dup} já existiam e foram pulados, {pul} inativos ignorados)")
             if erros:
                 st.warning(f"{len(erros)} linha(s) com problema (sem nome) foram puladas.")
+            st.balloons()
+
+    # ========================================================================= #
+    #  CONTATOS (telefones / e-mails dos tutores já cadastrados)                  #
+    # ========================================================================= #
+    elif tipo.startswith("📞"):
+        mapa = json.loads(get_config("imp_vetsoft_map", "{}") or "{}")
+        st.markdown("**Como as colunas do arquivo entram no CARDIOEVET:**")
+        st.caption("Este arquivo é o complemento do cadastro: cada linha tem o **código do "
+                   "tutor** e um **contato** (telefone ou e-mail). Se o tipo tiver “e-mail” "
+                   "(ou o valor tiver @) grava no campo **E-mail**; caso contrário, em **Telefone**. "
+                   "Telefones novos entram sem apagar os antigos (ficam separados por “ / ”).")
+        c1, c2 = st.columns(2)
+        guess_cod = _achar_col(cab, ["cod cliente", "codigo cliente", "codigo do cliente",
+                                     "código do cliente", "codigo do tutor", "codigo", "código"])
+        m_cod = c1.selectbox("Código do tutor/cliente", col_opts,
+                             index=col_opts.index(guess_cod) if guess_cod in col_opts else 0,
+                             key="imp_c_cod")
+        guess_nome = _achar_col(cab, ["cliente", "tutor", "responsavel", "responsável", "nome"])
+        m_nome = c2.selectbox("Nome do tutor (alternativa ao código)", col_opts,
+                              index=col_opts.index(guess_nome) if guess_nome in col_opts else 0,
+                              key="imp_c_nome")
+        c1, c2 = st.columns(2)
+        guess_val = _achar_col(cab, ["valor", "telefone", "numero", "número", "e-mail",
+                                     "email", "celular", "fone"])
+        m_valor = c1.selectbox("🔴 Valor do contato (telefone/e-mail)", col_opts,
+                               index=col_opts.index(guess_val) if guess_val in col_opts else 0,
+                               key="imp_c_valor")
+        guess_tipo = _achar_col(cab, ["contato", "tipo", "descricao", "descrição"])
+        m_tipo = c2.selectbox("Tipo do contato (celular, residencial, e-mail…)", col_opts,
+                              index=col_opts.index(guess_tipo) if guess_tipo in col_opts else 0,
+                              key="imp_c_tipo")
+        sobrescrever = st.checkbox(
+            "Substituir telefone/e-mail existente (em vez de acrescentar)",
+            value=False, key="imp_c_over")
+
+        tutores_banco = {_norm_chave(r["nome"]): int(r["id"]) for r in
+                         qdf("SELECT id, nome FROM tutores").to_dict("records")}
+
+        def _destino(r):
+            v = val(r, m_valor)
+            k = _sem_acento(_norm_chave(" ".join([val(r, m_tipo), v])))
+            return "e-mail" if ("mail" in k or "@" in v) else "telefone"
+
+        amostras = []
+        for r in linhas[:3]:
+            tutor_ok = bool((val(r, m_cod) and str(val(r, m_cod)) in mapa) or
+                            (val(r, m_nome) and _norm_chave(val(r, m_nome)) in tutores_banco))
+            amostras.append({"código": val(r, m_cod), "tutor": val(r, m_nome),
+                             "tutor localizado?": "✅" if tutor_ok else "❌",
+                             "vai para o campo": _destino(r),
+                             "contato": val(r, m_valor)})
+        with st.expander("🔎 Como vai ficar (exemplos)"):
+            st.dataframe(pd.DataFrame(amostras), hide_index=True, use_container_width=True)
+        if not tutores_banco:
+            st.warning("⚠️ Nenhum tutor cadastrado ainda — **importe primeiro o arquivo de "
+                       "Clientes** ou cadastre os tutores manualmente.")
+
+        if not _eh_coluna(m_valor):
+            st.error("Escolha a coluna do **Valor do contato**.")
+            return
+        if st.button(f"🚀 Importar {len(linhas)} contato(s) agora", type="primary",
+                     key="imp_go_c"):
+            atual = acresc = dup = sem_tutor = sem_valor = 0
+            faltantes, novos_mapa = set(), {}
+            barra = st.progress(0.0)
+            for i, r in enumerate(linhas):
+                barra.progress((i + 1) / len(linhas))
+                valor_c = val(r, m_valor)
+                if not valor_c:
+                    sem_valor += 1
+                    continue
+                tid = None
+                cod = val(r, m_cod)
+                if cod and str(cod) in mapa:
+                    tid = int(mapa[str(cod)])
+                elif _eh_coluna(m_nome) and val(r, m_nome):
+                    tid = tutores_banco.get(_norm_chave(val(r, m_nome)))
+                if not tid:
+                    sem_tutor += 1
+                    faltantes.add(val(r, m_nome) or cod or "—")
+                    continue
+                campo = "email" if _destino(r) == "e-mail" else "telefone"
+                atual_txt = qdf(f"SELECT {campo} c FROM tutores WHERE id=?", (tid,))
+                ex = _norm_txt(atual_txt.iloc[0]["c"]) if not atual_txt.empty else ""
+                if sobrescrever:
+                    if ex == valor_c:
+                        dup += 1
+                        continue
+                    run(f"UPDATE tutores SET {campo}=? WHERE id=?", (valor_c, tid))
+                    atual += 1
+                elif not ex:
+                    run(f"UPDATE tutores SET {campo}=? WHERE id=?", (valor_c, tid))
+                    atual += 1
+                elif valor_c in [p.strip() for p in ex.split("/")]:
+                    dup += 1
+                else:
+                    run(f"UPDATE tutores SET {campo}=? WHERE id=?", (f"{ex} / {valor_c}", tid))
+                    acresc += 1
+            barra.empty()
+            msg = (f"🎉 **Contatos importados!** {atual} tutor(es) receberam contato"
+                   f"{f', {acresc} contato(s) extra(s) acrescentado(s)' if acresc else ''}, "
+                   f"{dup} já estavam idênticos e foram pulados.")
+            st.success(msg)
+            if sem_tutor:
+                st.warning(f"⚠️ **{sem_tutor} contato(s) não entraram** porque o tutor não "
+                           f"foi localizado (ex.: {', '.join(list(faltantes)[:5])}). "
+                           "Importe primeiro o arquivo de Clientes e repita.")
+            if sem_valor:
+                st.caption(f"ℹ️ {sem_valor} linha(s) sem valor de contato foram ignoradas.")
             st.balloons()
 
     # ========================================================================= #
@@ -4235,14 +4379,13 @@ def pagina_importar():
         st.markdown("**Conexão com o tutor:** use o **código** do cliente quando houver "
                     f"({len(mapa)} código(s) já conhecido(s) da importação de clientes).")
         c1, c2 = st.columns(2)
+        _cands_cod_pet = ["codigo do cliente", "código do cliente", "codigo cliente",
+                          "cod cliente", "cód cliente", "cliente (código)", "codigo do tutor",
+                          "responsavel (codigo)", "código do responsável", "codigo do animal",
+                          "codigo do paciente", "codigo"]
         m_cod = c1.selectbox("Código do tutor/cliente", col_opts,
-                             index=col_opts.index(_achar_col(cab, ["codigo do cliente", "código do cliente",
-                                                                   "codigo cliente", "cliente (código)",
-                                                                   "codigo do tutor", "responsavel (codigo)",
-                                                                   "código do responsável", "codigo"]))
-                             if _achar_col(cab, ["codigo do cliente", "código do cliente", "codigo cliente",
-                                                 "cliente (código)", "codigo do tutor", "responsavel (codigo)",
-                                                 "código do responsável", "codigo"]) in col_opts else 0,
+                             index=col_opts.index(_achar_col(cab, _cands_cod_pet))
+                             if _achar_col(cab, _cands_cod_pet) in col_opts else 0,
                              key="imp_p_cod")
         m_tutor_nome = c2.selectbox("Nome do tutor (alternativa ao código)", col_opts,
                                     index=col_opts.index(_achar_col(cab, ["cliente", "tutor", "responsavel",
@@ -4254,6 +4397,30 @@ def pagina_importar():
                              index=col_opts.index(_achar_col(cab, ["observacao", "observação", "obs"]))
                              if _achar_col(cab, ["observacao", "observação", "obs"]) in col_opts else 0,
                              key="imp_p_obs")
+        anotar_extras = st.checkbox(
+            "Anotar nas observações: porte, nº de identificação e se é castrado (quando houver)",
+            value=True, key="imp_p_extras")
+        col_sit_p = _achar_col(cab, ["situacao", "situação", "status"])
+        so_ativos_p = True
+        if col_sit_p:
+            so_ativos_p = st.checkbox(f"Importar apenas pacientes ativos (coluna “{col_sit_p}”)",
+                                      value=True, key="imp_p_ativos")
+        st.caption("💡 Se o arquivo **não tiver coluna de espécie**, ela é detectada pela raça "
+                   "(ex.: “SRD (Felino)” → Gato); quando nada indica, assume-se **Cão**.")
+
+        amostras = []
+        for r in linhas[:3]:
+            esp_i, raca_l = _infer_especie_raca(val(r, m_raca))
+            amostras.append({
+                "pet": val(r, m_nome),
+                "espécie": val(r, m_esp) or esp_i or "Cão",
+                "raça": raca_l if (esp_i and not _eh_coluna(m_esp)) else val(r, m_raca),
+                "sexo": val(r, m_sexo) or "—",
+                "nascimento": val(r, m_nasc) or "—",
+                "tutor (cód.)": val(r, m_cod),
+            })
+        with st.expander("🔎 Como vai ficar (exemplos)"):
+            st.dataframe(pd.DataFrame(amostras), hide_index=True, use_container_width=True)
 
         tutores_banco = {(_norm_chave(r["nome"])): int(r["id"])
                          for r in qdf("SELECT id, nome FROM tutores").to_dict("records")}
@@ -4265,15 +4432,23 @@ def pagina_importar():
             st.error("Escolha a coluna do **Nome do pet**.")
             return
         if st.button(f"🚀 Importar {len(linhas)} paciente(s) agora", type="primary", key="imp_go_p"):
+            col_porte = _achar_col(cab, ["porte"])
+            col_ident = _achar_col(cab, ["nro identificacao", "nro identificação", "identificacao",
+                                         "identificação", "registro", "microchip"])
+            col_ester = _achar_col(cab, ["esterilizado", "castrado", "esterilização", "esterilizacao"])
             existentes = {(_norm_chave(r["nome"]), int(r["tutor_id"])) for r in
                           qdf("SELECT nome, tutor_id FROM pets").to_dict("records")}
-            ins = dup = sem_tutor = 0
+            ins = dup = sem_tutor = pul_inativos = 0
             faltantes = set()
             barra = st.progress(0.0)
             for i, r in enumerate(linhas):
                 barra.progress((i + 1) / len(linhas))
                 nome = val(r, m_nome)
                 if not nome:
+                    continue
+                if col_sit_p and so_ativos_p and val(r, col_sit_p) \
+                        and _norm_chave(val(r, col_sit_p)) != "ativo":
+                    pul_inativos += 1
                     continue
                 tid = None
                 cod = val(r, m_cod)
@@ -4288,19 +4463,35 @@ def pagina_importar():
                 if (_norm_chave(nome), tid) in existentes:
                     dup += 1
                     continue
+                esp_i, raca_l = _infer_especie_raca(val(r, m_raca))
+                especie = val(r, m_esp) or esp_i or "Cão"
+                raca_fin = (raca_l if (esp_i and not _eh_coluna(m_esp))
+                            else (val(r, m_raca) or None))
                 sx = val(r, m_sexo)
                 sx = ({"m": "Macho", "macho": "Macho", "f": "Fêmea", "femea": "Fêmea",
                        "fêmea": "Fêmea"}.get(_norm_chave(sx), sx.title() if sx else None))
+                obs_parts = []
+                if _eh_coluna(m_obs) and val(r, m_obs):
+                    obs_parts.append(val(r, m_obs))
+                if anotar_extras:
+                    if col_porte and val(r, col_porte):
+                        obs_parts.append(f"Porte: {val(r, col_porte)}")
+                    if col_ident and val(r, col_ident):
+                        obs_parts.append(f"ID: {val(r, col_ident)}")
+                    if col_ester and val(r, col_ester):
+                        obs_parts.append(f"Esterilizado: {val(r, col_ester)}")
+                obs_fin = " | ".join(p for p in obs_parts if p) or None
                 run("""INSERT INTO pets (tutor_id, nome, especie, raca, sexo, nascimento, peso,
                                        observacoes) VALUES (?,?,?,?,?,?,?,?)""",
-                    (tid, nome, val(r, m_esp) or None, val(r, m_raca) or None, sx,
+                    (tid, nome, especie or "Cão", raca_fin, sx,
                      _parse_data_iso(val(r, m_nasc)), _parse_peso(val(r, m_peso)),
-                     val(r, m_obs) or None))
+                     obs_fin))
                 existentes.add((_norm_chave(nome), tid))
                 ins += 1
             barra.empty()
+            extra_msg = (f", {pul_inativos} inativo(s) ignorado(s)" if pul_inativos else "")
             st.success(f"🎉 **{ins} pet(s) importado(s)!** "
-                       f"({dup} já existiam e foram pulados)")
+                       f"({dup} já existiam e foram pulados{extra_msg})")
             if sem_tutor:
                 st.warning(f"⚠️ **{sem_tutor} pet(s) NÃO foram importados** porque o tutor não foi "
                            "encontrado. Confira se os clientes foram importados primeiro "
