@@ -161,6 +161,7 @@ CREATE TABLE IF NOT EXISTS lancamentos (
     descricao       TEXT,
     valor           REAL NOT NULL,
     forma_pagamento TEXT,
+    status          TEXT DEFAULT 'Pago',  -- Pago | Pendente (a receber/pagar)
     pet_id          INTEGER REFERENCES pets(id) ON DELETE SET NULL,
     criado_em       TEXT DEFAULT (datetime('now', 'localtime'))
 );
@@ -269,6 +270,7 @@ def init_db():
     else:
         _init_db_local()
     garantir_admin()
+    garantir_colunas()
     garantir_modelos_padrao()
 
 
@@ -615,6 +617,51 @@ def garantir_modelos_padrao():
                     (cat, nome, texto))
     except Exception:
         pass  # não trava o início do app se a tabela ainda não existir
+
+
+# --------------------------------------------------------------------------- #
+#  Formas de pagamento (lista gerenciável) + migrações leves de colunas
+# --------------------------------------------------------------------------- #
+
+def get_formas_pagamento() -> list:
+    """Lista de formas de pagamento cadastráveis (salva no config; padrão embutido)."""
+    try:
+        lst = json.loads(get_config("formas_pagamento", "") or "[]")
+        lst = [str(x).strip() for x in (lst if isinstance(lst, list) else []) if str(x).strip()]
+        if lst:
+            return lst
+    except Exception:
+        pass
+    return list(FORMAS_PAGAMENTO)
+
+
+def set_formas_pagamento(lista: list):
+    set_config("formas_pagamento", json.dumps(lista, ensure_ascii=False))
+
+
+def opcoes_forma(atual: str = "") -> list:
+    """Opções do seletor — se o lançamento tem forma antiga fora da lista, ela é mantida."""
+    ops = get_formas_pagamento()
+    if atual and atual not in ops:
+        ops = ops + [atual]
+    return ops
+
+
+def _colunas_da_tabela(tabela: str) -> list:
+    try:
+        df = qdf(f"PRAGMA table_info({tabela})")
+        return df["name"].astype(str).tolist()
+    except Exception:
+        return []
+
+
+def garantir_colunas():
+    """Aplica migrações leves em bancos que já existiam (local ou nuvem)."""
+    try:
+        if "status" not in _colunas_da_tabela("lancamentos"):
+            run("ALTER TABLE lancamentos ADD COLUMN status TEXT DEFAULT 'Pago'")
+    except Exception:
+        pass
 
 
 def link_whatsapp(telefone: str, mensagem: str) -> str:
@@ -1940,18 +1987,109 @@ def pagina_financeiro():
     )
 
     receitas = float(qdf(
-        "SELECT COALESCE(SUM(valor),0) s FROM lancamentos WHERE tipo='Receita' AND substr(data,1,7)=?",
+        """SELECT COALESCE(SUM(valor),0) s FROM lancamentos
+           WHERE tipo='Receita' AND substr(data,1,7)=? AND COALESCE(status,'Pago')='Pago'""",
         (mes,),
     ).iloc[0]["s"])
     despesas = float(qdf(
-        "SELECT COALESCE(SUM(valor),0) s FROM lancamentos WHERE tipo='Despesa' AND substr(data,1,7)=?",
+        """SELECT COALESCE(SUM(valor),0) s FROM lancamentos
+           WHERE tipo='Despesa' AND substr(data,1,7)=? AND COALESCE(status,'Pago')='Pago'""",
         (mes,),
     ).iloc[0]["s"])
+    a_receber = float(qdf(
+        """SELECT COALESCE(SUM(valor),0) s FROM lancamentos
+           WHERE tipo='Receita' AND COALESCE(status,'Pago')='Pendente'""",
+        (),
+    ).iloc[0]["s"])
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("📈 Receitas", fmt_moeda(receitas))
-    c2.metric("📉 Despesas", fmt_moeda(despesas))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("📈 Receitas recebidas", fmt_moeda(receitas))
+    c2.metric("📉 Despesas pagas", fmt_moeda(despesas))
     c3.metric("💵 Saldo do mês", fmt_moeda(receitas - despesas))
+    c4.metric("⏳ A receber (em aberto)", fmt_moeda(a_receber))
+
+    # ---- Pendências em aberto (a receber / a pagar) -------------------------- #
+    pend = qdf(
+        """SELECT l.*, p.nome AS pet FROM lancamentos l
+           LEFT JOIN pets p ON p.id = l.pet_id
+           WHERE COALESCE(l.status,'Pago')='Pendente'
+           ORDER BY l.data, l.id"""
+    )
+    if not pend.empty:
+        with st.container(border=True):
+            st.markdown("#### ⏳ Pendências em aberto")
+            st.caption("Tudo que ficou marcado como **Pendente** — clique em **✔ Baixa** "
+                       "quando o dinheiro entrar/sair de fato. Some daqui depois de dada a baixa.")
+            p_rec = pend[pend["tipo"] == "Receita"]
+            p_desp = pend[pend["tipo"] == "Despesa"]
+            cp1, cp2 = st.columns(2)
+            for col_p, rot, sub in ((cp1, "💰 A receber", p_rec), (cp2, "🧾 A pagar", p_desp)):
+                with col_p:
+                    st.markdown(f"**{rot}: {fmt_moeda(float(sub['valor'].sum()))}** ({len(sub)})")
+                    for _, rpd in sub.head(12).iterrows():
+                        x1, x2 = st.columns([5, 1])
+                        x1.write(f"• {fmt_data(rpd['data'])} · {trunc(str(rpd['descricao']), 32)} "
+                                 f"· **{fmt_moeda(rpd['valor'])}**"
+                                 + (f" · 🐾 {rpd['pet']}" if rpd['pet'] else ""))
+                        if x2.button("✔", key=f"baixa_{int(rpd['id'])}",
+                                     help="Dar baixa (marcar como pago)"):
+                            run("UPDATE lancamentos SET status='Pago' WHERE id=?",
+                                (int(rpd["id"]),))
+                            st.toast("✔ Baixa realizada!")
+                            st.rerun()
+                    if len(sub) > 12:
+                        st.caption(f"… e mais {len(sub) - 12} item(ns). Veja todos na lista do mês.")
+
+    # ---- Gerenciar formas de pagamento (admin) -------------------------------- #
+    if (st.session_state.get("usuario") or {}).get("papel") == "admin":
+        with st.expander("🛠 Gerenciar formas de pagamento (PIX, crédito, débito…)"):
+            formas = get_formas_pagamento()
+            st.markdown("**Formas disponíveis hoje:**")
+            st.write(" · ".join(f"`{f}`" for f in formas))
+            c1, c2 = st.columns([4, 1])
+            nova_fp = c1.text_input("➕ Nova forma de pagamento", key="fp_nova",
+                                    placeholder="Ex.: Crédito parcelado, Crediário próprio…")
+            c2.markdown("<br>", unsafe_allow_html=True)
+            if c2.button("Adicionar", key="fp_add", type="primary"):
+                nv = nova_fp.strip()
+                if not nv:
+                    st.error("Digite o nome da forma.")
+                elif nv.casefold() in [f.casefold() for f in formas]:
+                    st.warning("Essa forma já existe na lista.")
+                else:
+                    set_formas_pagamento(formas + [nv])
+                    st.success(f"**{nv}** adicionada!")
+                    st.rerun()
+            if formas:
+                st.markdown("**✏️ Renomear forma existente**")
+                r1, r2, r3 = st.columns([3, 3, 3])
+                ren_sel = r1.selectbox("Forma", formas, key="fp_ren_sel")
+                ren_nv = r2.text_input("Novo nome", key="fp_ren_nv")
+                ren_ant = r3.checkbox("Atualizar também os lançamentos antigos com o novo nome",
+                                      value=True, key="fp_ren_ant")
+                if st.button("💾 Renomear", key="fp_ren_btn"):
+                    nv2 = ren_nv.strip()
+                    if not nv2 or nv2 == ren_sel:
+                        st.error("Digite um nome novo válido.")
+                    elif nv2.casefold() in [f.casefold() for f in formas if f != ren_sel]:
+                        st.warning("Já existe uma forma com esse nome.")
+                    else:
+                        set_formas_pagamento([nv2 if f == ren_sel else f for f in formas])
+                        if ren_ant:
+                            run("UPDATE lancamentos SET forma_pagamento=? WHERE forma_pagamento=?",
+                                (nv2, ren_sel))
+                        st.success(f"**{ren_sel}** renomeada para **{nv2}**!")
+                        st.rerun()
+                st.markdown("**🗑️ Excluir forma da lista**")
+                d1, d2, d3 = st.columns([3, 3, 3])
+                del_sel = d1.selectbox("Forma a excluir", formas, key="fp_del_sel")
+                conf_del_fp = d2.checkbox(
+                    "Confirmo. (Lançamentos antigos mantêm o nome registrado.)",
+                    key="fp_del_conf")
+                if d3.button("Excluir forma", disabled=not conf_del_fp, key="fp_del_btn"):
+                    set_formas_pagamento([f for f in formas if f != del_sel])
+                    st.success("Forma excluída da lista.")
+                    st.rerun()
 
     # ---- Tabela de serviços e valores --------------------------------------- #
     with st.expander("🩺 Tabela de serviços e valores"):
@@ -2048,17 +2186,23 @@ def pagina_financeiro():
             cat_def = st.session_state.get("nl_default_cat")
             categoria = c2.selectbox("Categoria", cat_opts,
                                      index=cat_opts.index(cat_def) if cat_def in cat_opts else 0)
-            pagamento = c3.selectbox("Forma de pagamento", FORMAS_PAGAMENTO)
+            pagamento = c3.selectbox("Forma de pagamento", opcoes_forma())
             descricao = st.text_input(
                 "Descrição *", value=st.session_state.get("nl_default_desc", ""),
                 placeholder="Ex.: Consulta de rotina, compra de ração…")
-            c4, c5 = st.columns(2)
+            c4, c5, c6 = st.columns([2, 2, 3])
             valor = c4.number_input("Valor (R$) *", min_value=0.0,
                                     value=st.session_state.get("nl_default_valor", 0.0) or None,
                                     step=10.0, format="%.2f")
+            _rot_sit = "✅ Recebido" if tipo == "Receita" else "✅ Pago"
+            situacao = c5.selectbox(
+                "Situação", [_rot_sit, "⏳ Pendente"],
+                help="Escolha “⏳ Pendente” se o dinheiro ainda não entrou/saiu — "
+                     "fica em aberto até você dar baixa nas Pendências.")
+            status_lanc = "Pago" if situacao.startswith("✅") else "Pendente"
             op = {"— Não vincular —": None}
             op.update({f"{r['nome']} — {r['tutor']}": r["id"] for _, r in pets.iterrows()})
-            pet_lbl = c5.selectbox("Vincular a um pet (opcional)", list(op.keys()))
+            pet_lbl = c6.selectbox("Vincular a um pet (opcional)", list(op.keys()))
             if st.form_submit_button("💾 Salvar lançamento", type="primary"):
                 if valor is None or valor <= 0:
                     st.error("Informe um valor maior que zero.")
@@ -2067,10 +2211,10 @@ def pagina_financeiro():
                 else:
                     run(
                         """INSERT INTO lancamentos (data, tipo, categoria, descricao, valor,
-                                                    forma_pagamento, pet_id)
-                           VALUES (?,?,?,?,?,?,?)""",
+                                                    forma_pagamento, status, pet_id)
+                           VALUES (?,?,?,?,?,?,?,?)""",
                         (data.isoformat(), tipo, categoria, descricao.strip(),
-                         float(valor), pagamento, op[pet_lbl]),
+                         float(valor), pagamento, status_lanc, op[pet_lbl]),
                     )
                     for k in ("nl_default_desc", "nl_default_valor", "nl_default_cat"):
                         st.session_state.pop(k, None)
@@ -2094,17 +2238,20 @@ def pagina_financeiro():
     view = df.copy()
     view["data"] = view["data"].map(fmt_data)
     view["tipo"] = view["tipo"].map({"Receita": "🟢 Receita", "Despesa": "🔴 Despesa"})
+    view["Situação"] = view["status"].fillna("Pago").map({"Pago": "✔", "Pendente": "⏳"})
     st.dataframe(
-        view[["data", "tipo", "categoria", "descricao", "pet", "forma_pagamento", "valor"]],
+        view[["data", "tipo", "categoria", "descricao", "pet", "forma_pagamento",
+              "valor", "Situação"]],
         hide_index=True, use_container_width=True,
         column_config={
             "data": "Data", "tipo": "Tipo", "categoria": "Categoria", "descricao": "Descrição",
             "pet": "Pet", "forma_pagamento": "Pagamento",
             "valor": st.column_config.NumberColumn("Valor", format="R$ %.2f"),
+            "Situação": st.column_config.TextColumn("Situação", help="✔ pago/recebido · ⏳ pendente"),
         },
     )
     botao_csv(
-        df[["data", "tipo", "categoria", "descricao", "pet", "forma_pagamento", "valor"]],
+        df[["data", "tipo", "categoria", "descricao", "pet", "forma_pagamento", "status", "valor"]],
         f"financeiro_{mes}.csv", "⬇️ Baixar mês em CSV",
     )
 
@@ -2129,6 +2276,32 @@ def pagina_financeiro():
         )
         st.bar_chart(cat, x="categoria", y="total", color="tipo")
 
+    # ---- Resumo por forma de pagamento --------------------------------------- #
+    st.subheader("💳 Por forma de pagamento (somente valores pagos/recebidos)")
+    fp_mes = qdf(
+        """SELECT COALESCE(NULLIF(forma_pagamento,''),'Outro') AS Forma,
+                  SUM(CASE WHEN tipo='Receita' THEN valor ELSE 0 END) AS Receitas,
+                  SUM(CASE WHEN tipo='Despesa' THEN valor ELSE 0 END) AS Despesas
+           FROM lancamentos
+           WHERE substr(data,1,7)=? AND COALESCE(status,'Pago')='Pago'
+           GROUP BY Forma ORDER BY Receitas DESC""",
+        (mes,),
+    )
+    if fp_mes.empty:
+        st.info("Nenhum valor pago/recebido neste mês para exibir por forma de pagamento.")
+    else:
+        g3, g4 = st.columns(2)
+        with g3:
+            st.bar_chart(fp_mes.set_index("Forma")[["Receitas", "Despesas"]])
+        with g4:
+            tot_rec = float(fp_mes["Receitas"].sum())
+            tab = fp_mes.copy()
+            tab["% das receitas"] = tab["Receitas"].map(
+                lambda v: f"{(v / tot_rec * 100):.0f}%" if tot_rec else "—")
+            tab["Receitas"] = tab["Receitas"].map(fmt_moeda)
+            tab["Despesas"] = tab["Despesas"].map(fmt_moeda)
+            st.dataframe(tab, hide_index=True, use_container_width=True)
+
     # ---- Editar / excluir ------------------------------------------------------- #
     with st.expander("✏️ Editar ou excluir lançamento"):
         op_l = {f"{fmt_data(r['data'])} — {r['descricao']} ({fmt_moeda(r['valor'])}) (#{r['id']})": r["id"]
@@ -2150,18 +2323,28 @@ def pagina_financeiro():
                 "Categoria", cats,
                 index=cats.index(reg["categoria"]) if reg["categoria"] in cats else 0,
             )
+            _fp_val = reg["forma_pagamento"] if (reg["forma_pagamento"] is not None
+                                                 and str(reg["forma_pagamento"]).strip()) else ""
+            _ops_fp = opcoes_forma(str(_fp_val))
             pagamento = c3.selectbox(
-                "Forma de pagamento", FORMAS_PAGAMENTO,
-                index=FORMAS_PAGAMENTO.index(reg["forma_pagamento"])
-                if reg["forma_pagamento"] in FORMAS_PAGAMENTO else 0,
+                "Forma de pagamento", _ops_fp,
+                index=_ops_fp.index(_fp_val) if _fp_val in _ops_fp else 0,
             )
             descricao = st.text_input("Descrição *", value=reg["descricao"] or "")
-            c4, c5 = st.columns(2)
+            c4, c5, c6 = st.columns([2, 2, 3])
             valor = c4.number_input(
                 "Valor (R$) *", min_value=0.0,
                 value=float(reg["valor"]) if pd.notna(reg["valor"]) else None,
                 step=10.0, format="%.2f",
             )
+            _sit_atual = (reg["status"] if isinstance(reg.get("status"), str) and reg["status"]
+                          else "Pago")
+            _rot_sit_e = "✅ Recebido" if tipo_e == "Receita" else "✅ Pago"
+            situacao_e = c5.selectbox(
+                "Situação", [_rot_sit_e, "⏳ Pendente"],
+                index=0 if _sit_atual == "Pago" else 1,
+                help="“⏳ Pendente” = ainda não entrou/saiu o dinheiro.")
+            status_lanc_e = "Pago" if situacao_e.startswith("✅") else "Pendente"
             op = {"— Não vincular —": None}
             op.update({f"{r['nome']} — {r['tutor']}": r["id"] for _, r in pets.iterrows()})
             labels = list(op.keys())
@@ -2170,7 +2353,7 @@ def pagina_financeiro():
             for lbl, vid_ in op.items():
                 if vid_ == pet_ref:
                     atual = lbl
-            pet_lbl = c5.selectbox("Vincular a um pet (opcional)", labels,
+            pet_lbl = c6.selectbox("Vincular a um pet (opcional)", labels,
                                    index=labels.index(atual) if atual else 0)
             if st.form_submit_button("💾 Salvar alterações", type="primary"):
                 if valor is None or valor <= 0:
@@ -2180,9 +2363,9 @@ def pagina_financeiro():
                 else:
                     run(
                         """UPDATE lancamentos SET data=?, tipo=?, categoria=?, descricao=?,
-                           valor=?, forma_pagamento=?, pet_id=? WHERE id=?""",
+                           valor=?, forma_pagamento=?, status=?, pet_id=? WHERE id=?""",
                         (data.isoformat(), tipo_e, categoria, descricao.strip(),
-                         float(valor), pagamento, op[pet_lbl], lid),
+                         float(valor), pagamento, status_lanc_e, op[pet_lbl], lid),
                     )
                     st.success("Lançamento atualizado!")
                     st.rerun()
@@ -2480,11 +2663,23 @@ def gerar_pdf_historico(pid: int) -> bytes:
 
 def gerar_pdf_financeiro(mes: str) -> bytes:
     rec = float(qdf(
-        "SELECT COALESCE(SUM(valor),0) s FROM lancamentos WHERE tipo='Receita' AND substr(data,1,7)=?",
+        """SELECT COALESCE(SUM(valor),0) s FROM lancamentos
+           WHERE tipo='Receita' AND substr(data,1,7)=? AND COALESCE(status,'Pago')='Pago'""",
         (mes,),
     ).iloc[0]["s"])
     desp = float(qdf(
-        "SELECT COALESCE(SUM(valor),0) s FROM lancamentos WHERE tipo='Despesa' AND substr(data,1,7)=?",
+        """SELECT COALESCE(SUM(valor),0) s FROM lancamentos
+           WHERE tipo='Despesa' AND substr(data,1,7)=? AND COALESCE(status,'Pago')='Pago'""",
+        (mes,),
+    ).iloc[0]["s"])
+    p_rec = float(qdf(
+        """SELECT COALESCE(SUM(valor),0) s FROM lancamentos
+           WHERE tipo='Receita' AND substr(data,1,7)=? AND COALESCE(status,'Pago')='Pendente'""",
+        (mes,),
+    ).iloc[0]["s"])
+    p_desp = float(qdf(
+        """SELECT COALESCE(SUM(valor),0) s FROM lancamentos
+           WHERE tipo='Despesa' AND substr(data,1,7)=? AND COALESCE(status,'Pago')='Pendente'""",
         (mes,),
     ).iloc[0]["s"])
     df = qdf(
@@ -2498,22 +2693,31 @@ def gerar_pdf_financeiro(mes: str) -> bytes:
     pdf.set_font("helvetica", "B", 11)
     pdf.cell(
         0, 7,
-        pdf_san(f"Receitas: {fmt_moeda(rec)}    Despesas: {fmt_moeda(desp)}    Saldo: {fmt_moeda(rec - desp)}"),
+        pdf_san(f"Recebido: {fmt_moeda(rec)}    Pago: {fmt_moeda(desp)}    Saldo: {fmt_moeda(rec - desp)}"),
         align="C", new_x="LMARGIN", new_y="NEXT",
     )
+    if p_rec or p_desp:
+        pdf.set_font("helvetica", "", 10)
+        pdf.cell(
+            0, 6,
+            pdf_san(f"Pendencias do mes -> a receber: {fmt_moeda(p_rec)}   a pagar: {fmt_moeda(p_desp)}"),
+            align="C", new_x="LMARGIN", new_y="NEXT",
+        )
     pdf.ln(4)
     if df.empty:
         pdf_vazio(pdf, "Nenhum lançamento neste mês.")
     else:
         linhas = [
             [
-                fmt_data(x["data"]), x["tipo"], trunc(x["categoria"], 16), trunc(x["descricao"], 44),
-                trunc(x["forma_pagamento"] or "-", 12), fmt_moeda(x["valor"]),
+                fmt_data(x["data"]), x["tipo"], trunc(x["categoria"], 14), trunc(x["descricao"], 40),
+                trunc(x["forma_pagamento"] or "-", 12),
+                "pendente" if str(x.get("status") or "Pago") == "Pendente" else "ok",
+                fmt_moeda(x["valor"]),
             ]
             for _, x in df.iterrows()
         ]
-        pdf_tabela(pdf, ["Data", "Tipo", "Categoria", "Descrição", "Pagam.", "Valor"],
-                   linhas, [20, 18, 28, 72, 20, 22], ["C", "L", "L", "L", "L", "R"])
+        pdf_tabela(pdf, ["Data", "Tipo", "Categoria", "Descrição", "Pagam.", "Sit.", "Valor"],
+                   linhas, [19, 17, 26, 65, 18, 20, 20], ["C", "L", "L", "L", "L", "C", "R"])
     return bytes(pdf.output())
 
 
@@ -2981,12 +3185,13 @@ def pagina_recibos():
             if r.get("pet"):
                 servico = f"{servico} — Pet: {r['pet']}"
             valor = float(r["valor"])
-            forma = r["forma_pagamento"] if r["forma_pagamento"] in FORMAS_PAGAMENTO else "PIX"
+            forma = str(r["forma_pagamento"] or "PIX")
             sufixo = str(lid)
         else:
             sufixo = "livre"
 
-        def_i = FORMAS_PAGAMENTO.index(forma) if forma in FORMAS_PAGAMENTO else 1
+        _ops_rec = opcoes_forma(forma)
+        def_i = _ops_rec.index(forma) if forma in _ops_rec else 0
         with st.form(f"form_recibo_{sufixo}"):
             c1, c2 = st.columns(2)
             f_nome = c1.text_input("Recebido de (tutor/cliente) *", value=nome)
@@ -2994,7 +3199,7 @@ def pagina_recibos():
                                       step=10.0, format="%.2f")
             f_serv = st.text_input("Referente a (serviço/pet) *", value=servico)
             c3, c4 = st.columns(2)
-            f_forma = c3.selectbox("Forma de pagamento", FORMAS_PAGAMENTO, index=def_i)
+            f_forma = c3.selectbox("Forma de pagamento", _ops_rec, index=def_i)
             f_data = c4.date_input("Data", value=date.today(), format="DD/MM/YYYY")
             f_obs = st.text_input("Observações (opcional)")
             f_cid = st.text_input("Local (cidade/UF)", value=get_config("rec_cidade", "Penha/SC") or "Penha/SC")
