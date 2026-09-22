@@ -269,6 +269,7 @@ def init_db():
     else:
         _init_db_local()
     garantir_admin()
+    garantir_profissionais()
     garantir_colunas()
     garantir_modelos_padrao()
 
@@ -489,6 +490,35 @@ def garantir_admin():
             "INSERT INTO usuarios (usuario, nome, senha_hash, papel) VALUES (?,?,?,?)",
             ("admin", "Administrador", hash_senha("admin123"), "admin"),
         )
+
+
+def garantir_profissionais():
+    """Cria os dois acessos profissionais padrão (usuario1/usuario2), uma única vez.
+
+    Depois de criados, Nome/Papel/Senha são editáveis em 🔐 Usuários.
+    A flag em config evita recriá-los caso sejam excluídos de propósito."""
+    if get_config("profissionais_seed_ok"):
+        return
+    padrao = [
+        ("usuario1", "Profissional 1"),
+        ("usuario2", "Profissional 2"),
+    ]
+    try:
+        existentes = {
+            u.casefold() for u in
+            qdf("SELECT usuario FROM usuarios")["usuario"].astype(str).tolist()
+        }
+        for usr, nome in padrao:
+            if usr.casefold() in existentes:
+                continue
+            try:
+                run("INSERT INTO usuarios (usuario, nome, senha_hash, papel) VALUES (?,?,?,?)",
+                    (usr, nome, hash_senha("usuario123"), "veterinario"))
+            except Exception:
+                pass
+        set_config("profissionais_seed_ok", "1")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
