@@ -57,7 +57,6 @@ SERVICOS_SEED = [
     ("Ecocardiograma (ECO)", "Exame", 450.0),
     ("Eletrocardiograma (ECG)", "Exame", 150.0),
     ("Holter 24h", "Exame", 550.0),
-    ("MAPA (pressão ambulatorial)", "Exame", 500.0),
     ("Raio-X de tórax", "Exame", 250.0),
     ("Ultrassom abdominal", "Exame", 350.0),
     ("Hemograma completo", "Exame", 90.0),
@@ -660,6 +659,13 @@ def garantir_colunas():
     try:
         if "status" not in _colunas_da_tabela("lancamentos"):
             run("ALTER TABLE lancamentos ADD COLUMN status TEXT DEFAULT 'Pago'")
+    except Exception:
+        pass
+    # Remove o serviço MAPA (pressão ambulatorial) das tabelas já populadas —
+    # o item saiu da lista padrão da clínica. Lançamentos antigos no financeiro
+    # NÃO são afetados (guardam apenas o texto no histórico).
+    try:
+        run("DELETE FROM servicos WHERE nome = 'MAPA (pressão ambulatorial)'")
     except Exception:
         pass
 
